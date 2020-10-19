@@ -4,6 +4,7 @@
 #include <openssl/ssl.h>
 #include <string>
 #include <sys/socket.h>
+#include <unordered_map>
 #include <limits>
 
 #define EINTRWRAP(ret, op)                      \
@@ -44,6 +45,7 @@ private:
     static int sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx);
     static void sslCtxInfoCallback(const SSL *ssl, int where, int ret);
 
+    static std::unordered_map<SSL *, WebSocket *> sSockets;
     std::string mUrl, mCipherlist, mTruststore, mHostname;
     State mState { Unset };
     unsigned long long mConnectTimeout { std::numeric_limits<unsigned long long>::max() };

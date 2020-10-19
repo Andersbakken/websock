@@ -76,6 +76,7 @@ static bool setNonblocking(int fd, std::string *err)
     return true;
 }
 
+std::unordered_map<SSL *, WebSocket *> WebSocket::sSockets;
 WebSocket::WebSocket()
 {
 }
@@ -85,6 +86,7 @@ WebSocket::~WebSocket()
     int ret;
 
     if (mSSL) {
+        sSockets.erase(mSSL);
         SSL_free(mSSL);
     }
 
@@ -372,7 +374,7 @@ void WebSocket::createSSL()
     BIO *bio = BIO_new_socket(mFD, false);
     assert(bio);
     SSL_set_bio(mSSL, bio, bio);
-
+    sSockets[mSSL] = this;
 }
 
 const char *WebSocket::stateToString(State state)
@@ -391,7 +393,8 @@ const char *WebSocket::stateToString(State state)
 
 void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
 {
-    // SSL_CTX *sslInitialCtx = SSL_get_SSL_CTX(ssl);
+    WebSocket *sock = sSockets[const_cast<SSL *>(ssl)];
+    assert(sock);
     const char *str;
 
     if (where & SSL_ST_CONNECT) {
@@ -403,19 +406,19 @@ void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
     }
 
     if (where & SSL_CB_HANDSHAKE_DONE) {
-        printf("[WEBSOCK SSL] - %s: handshake done session %sreused\n", "", // data->resource->url(),
+        printf("[WEBSOCK SSL] - %s: handshake done session %sreused\n", sock->mUrl.c_str(),
                SSL_session_reused(const_cast<SSL *>(ssl)) ? "" : "not ");
         // data->metrics.setSSLMode(SSL_session_reused(const_cast<SSL *>(ssl)) ? NetworkMetrics::SSLResumed : NetworkMetrics::SSL);
     }
 
     if (where & SSL_CB_LOOP) {
-        printf("[WEBSOCK SSL] - %s: %s:%s\n", "", str, SSL_state_string_long(ssl));
+        printf("[WEBSOCK SSL] - %s: %s:%s\n", sock->mUrl.c_str(), str, SSL_state_string_long(ssl));
     } else if (where & SSL_CB_ALERT) {
-        printf("[WEBSOCK SSL] - %s: SSL3 alert %s:%s:%s\n", "",
+        printf("[WEBSOCK SSL] - %s: SSL3 alert %s:%s:%s\n", sock->mUrl.c_str(),
                str, SSL_alert_type_string_long(ret),
                SSL_alert_desc_string_long(ret));
     } else if (where & SSL_CB_EXIT && ret <= 0) {
-        printf("[WEBSOCK SSL] - %s: %s:%s in %s\n", "", str, ret ? "error" : "failed",
+        printf("[WEBSOCK SSL] - %s: %s:%s in %s\n", sock->mUrl.c_str(), str, ret ? "error" : "failed",
                SSL_state_string_long(ssl));
     }
 }
