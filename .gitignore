@@ -1,0 +1,13 @@
+/.gdb_brestore.txt
+/.gdb_history
+/.ninja_deps
+/.ninja_log
+/CMakeCache.txt
+/CMakeFiles/
+/build.ninja
+/cmake_install.cmake
+/compile_commands.json
+/websock
+/libwebsock.a
+/rules.ninja
+/.gdb_brestore
