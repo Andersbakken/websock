@@ -34,12 +34,16 @@ public:
         Closed,
         Error
     };
+    static const char *stateToString(State state);
     State state() const { return mState; }
 
-    void select(int &nfds, fd_set &r, fd_set &w, unsigned long long &timeout);
-    void processSockets(int count, const fd_set &r, const fd_set &w);
+    void prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long long &timeout);
+    void processSelect(int count, const fd_set &r, const fd_set &w);
 private:
+    void createSSL();
     static int sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx);
+    static void sslCtxInfoCallback(const SSL *ssl, int where, int ret);
+
     std::string mUrl, mCipherlist, mTruststore, mHostname;
     State mState { Unset };
     unsigned long long mConnectTimeout { std::numeric_limits<unsigned long long>::max() };

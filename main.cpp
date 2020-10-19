@@ -62,17 +62,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    fd_set r, w;
     while (websocket.state() != WebSocket::Error && websocket.state() != WebSocket::Closed) {
+        fd_set r, w;
         FD_ZERO(&r);
         FD_ZERO(&w);
-        unsigned long long timeout = 1000;
+        unsigned long long timeout = 100000;
         int maxFd = 0;
-        websocket.select(maxFd, r, w, timeout);
+        websocket.prepareSelect(maxFd, r, w, timeout);
         int ret;
         timeval t = { static_cast<time_t>(timeout / 1000), static_cast<suseconds_t>((timeout % 1000) * 1000 ) };
         EINTRWRAP(ret, ::select(maxFd + 1, &r, &w, nullptr, &t));
-        websocket.processSockets(ret, r, w);
+        websocket.processSelect(ret, r, w);
         printf("state is %d\n", websocket.state());
     }
 
