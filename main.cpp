@@ -6,6 +6,7 @@
 #include <string.h>
 #include <string>
 #include <sys/socket.h>
+#include "truststore.cpp"
 
 int main(int argc, char **argv)
 {
@@ -38,6 +39,7 @@ int main(int argc, char **argv)
         port = atoi(options.url.c_str() + colon + 1);
     }
     options.hostname = options.url.substr(start + 3, end - start - 3);
+    options.truststore = truststore;
     printf("hostname [%s]\n", options.hostname.c_str());
 
     hostent *host = gethostbyname(options.hostname.c_str());
@@ -77,12 +79,14 @@ int main(int argc, char **argv)
         websocket.prepareSelect(maxFd, r, w, timeout);
         int ret;
         timeval t = { static_cast<time_t>(timeout / 1000), static_cast<suseconds_t>((timeout % 1000) * 1000 ) };
-        printf("Calling select maxFd: %d, timeout: %llu\n",
-               maxFd + 1, timeout);
+        printf("Calling select for %s maxFd: %d, timeout: %llu\n",
+               WebSocket::stateToString(websocket.state()), maxFd + 1, timeout);
         EINTRWRAP(ret, ::select(maxFd + 1, &r, &w, nullptr, &t));
-        printf("Select returned %d %d %s\n", ret, errno, strerror(errno));
+        printf("Select for %s returned %d %d %s\n",
+               WebSocket::stateToString(websocket.state()),
+               ret, ret == -1 ? errno : 0, ret == -1 ? strerror(errno) : "");
         websocket.processSelect(ret, r, w);
-        printf("state is %d\n", websocket.state());
+        // printf("state is %d\n", websocket.state());
     }
 
     // while (websocket

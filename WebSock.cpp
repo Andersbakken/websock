@@ -178,7 +178,7 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
 void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
 {
     mWokenUp = false;
-    printf("processSelect %s %d - %d %d - %d\n", stateToString(mState),
+    printf("processSelect %s count: %d - read: %d write: %d - pipe: %d\n", stateToString(mState),
            count, FD_ISSET(mFD, &r), FD_ISSET(mFD, &r), FD_ISSET(mPipe[0], &r));
 
     if (FD_ISSET(mPipe[0], &r)) {
@@ -283,6 +283,7 @@ void WebSocket::wakeup()
 
 int WebSocket::sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
 {
+    printf("Got sslCtxVerifyCallback %d\n", preverify_ok);
     return preverify_ok;
 }
 
@@ -396,6 +397,7 @@ void WebSocket::createSSL()
         assert(b);
         while (true) {
             X509 *x509 = PEM_read_bio_X509(b, 0, 0, 0);
+            printf("GOT HELLA X509 %p\n", x509);
             if (!x509)
                 break;
             X509_STORE_add_cert(store, x509);
