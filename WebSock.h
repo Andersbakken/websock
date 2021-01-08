@@ -45,8 +45,9 @@ public:
     void wakeup();
 private:
     std::string createUpgradeRequest();
-    void write(const void *data, size_t len);
+    void addToWriteBuffer(const void *data, size_t len);
     void writeSocketBuffer();
+    void acceptUpgrade();
     void createSSL();
     void sslConnect(int count, const fd_set &r, const fd_set &w);
     void createWSContext();
@@ -73,7 +74,7 @@ private:
     int mPipe[2] { -1, -1 };
     bool mWokenUp { false };
     wslay_event_context *mWSContext { nullptr };
-    std::string mUpgradeKey;
+    std::string mUpgradeKey, mUpgradeResponse;
     unsigned char *mWriteBuffer { nullptr };
     size_t mWriteBufferSize { 0 };
     bool mWss { false };

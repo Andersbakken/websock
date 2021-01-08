@@ -13,6 +13,7 @@
 #include <assert.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/sha.h>
 
 #if !defined(__GNUC__) || defined(__ANDROID__)
 # define PRINTF_ATTR(x,y)
@@ -20,7 +21,30 @@
 # define PRINTF_ATTR(x,y) __attribute__ ((__format__ (__printf__, x, y)))
 #endif
 
-static std::string base64Encode(const unsigned char* in, size_t in_len);
+namespace Utils {
+inline const char *strcasestr(const char *haystack, const char *needle, size_t needleLen = std::string::npos)
+{
+    if (needleLen == std::string::npos)
+        needleLen = strlen(needle);
+    assert(needle);
+    assert(haystack);
+    assert(needleLen);
+    const char c = static_cast<char>(tolower(static_cast<unsigned char>(*needle++)));
+    char sc;
+
+    do {
+        do {
+            if ((sc = *haystack++) == 0)
+                return nullptr;
+        } while (static_cast<char>(tolower(static_cast<unsigned char>(sc))) != c);
+    } while (strncasecmp(haystack, needle, needleLen - 1) != 0);
+    --haystack;
+    return haystack;
+}
+}
+
+static std::string base64Encode(const unsigned char *in, size_t in_len);
+static std::string sha1(const unsigned char *in, size_t len);
 static inline unsigned long long mono();
 static std::string format(const char *fmt, ...) PRINTF_ATTR(1, 2);
 static bool setNonblocking(int fd, std::string *err);
@@ -213,11 +237,33 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
         if (mUpgradeKey.empty()) {
             std::string req = createUpgradeRequest();
             assert(!mUpgradeKey.empty());
-            write(req.c_str(), req.size());
+            addToWriteBuffer(req.c_str(), req.size());
         }
 
         if ((wasEmpty || FD_ISSET(mFD, &w)) && mWriteBuffer) {
             writeSocketBuffer();
+        }
+
+        if (FD_ISSET(mFD, &r)) {
+            char buf[1024];
+            while (true) {
+                int r;
+                EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
+                if (r == -1) {
+                    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                        printf("Got an error reading: %d %s\n",
+                               errno, strerror(errno));
+                        mState = Error;
+                    }
+                    break;
+                } else if (!r) {
+                    mState = Closed;
+                    break;
+                } else {
+                    mUpgradeResponse.append(buf, r);
+                    acceptUpgrade();
+                }
+            }
         }
         break; }
     case Connected:
@@ -241,7 +287,7 @@ int WebSocket::sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
 }
 
 
-void WebSocket::write(const void *data, size_t len)
+void WebSocket::addToWriteBuffer(const void *data, size_t len)
 {
     assert(len);
     mWriteBuffer = reinterpret_cast<unsigned char *>(realloc(mWriteBuffer, mWriteBufferSize + len));
@@ -262,6 +308,7 @@ void WebSocket::writeSocketBuffer()
             if (errno != EWOULDBLOCK && errno != EAGAIN) {
                 printf("Got an error writing: %d %s\n",
                        errno, strerror(errno));
+                mState = Error;
             }
             break;
         } else {
@@ -279,6 +326,49 @@ void WebSocket::writeSocketBuffer()
         mWriteBuffer = reinterpret_cast<unsigned char *>(realloc(mWriteBuffer, remaining));
         mWriteBufferSize = remaining;
     }
+}
+
+void WebSocket::acceptUpgrade()
+{
+    const char *data = mUpgradeResponse.c_str();
+    const char *header = Utils::strcasestr(data + 1, "\nsec-websocket-accept:");
+    if (!header)
+        return;
+    header += 22;
+    while (isspace(static_cast<unsigned char>(*header)))
+        ++header;
+
+    if (!*header) {
+        printf("WS: Invalid header\n");
+        mState = Error;
+        return;
+    }
+
+    const char *headerEnd = strstr(header, "\r\n");
+    if (!headerEnd) {
+        printf("WS: No crlf after Accept\n");
+        mState = Error;
+        return;
+    }
+    while (headerEnd > header && isspace(static_cast<unsigned char>(*(headerEnd - 1))))
+        --headerEnd;
+
+    std::string acceptKey = mUpgradeKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    acceptKey = sha1(reinterpret_cast<const unsigned char *>(acceptKey.c_str()), acceptKey.size());
+
+    if (static_cast<size_t>(headerEnd - header) != acceptKey.size()) {
+        printf("WS: Wrong key length %d %zu\n", static_cast<int>(headerEnd - header), acceptKey.size());
+        mState = Error;
+        return;
+    }
+
+    if (strncmp(header, acceptKey.c_str(), acceptKey.size())) {
+        printf("WS: Wrong key %s %s", acceptKey.c_str(), std::string(header, headerEnd).c_str());
+        mState = Error;
+        return;
+    }
+    printf("Accepted ws handshake\n");
+    mState = Connected;
 }
 
 void WebSocket::createSSL()
@@ -493,6 +583,18 @@ static std::string base64Encode(const unsigned char* in, size_t in_len)
     return ret;
 }
 
+std::string sha1(const unsigned char *in, size_t in_len) // returns base 64 of the sha
+{
+    SHA_CTX context;
+    if (!SHA1_Init(&context))
+        std::string();
+
+    unsigned char buf[SHA_DIGEST_LENGTH];
+    SHA1_Update(&context, in, in_len);
+    SHA1_Final(buf, &context);
+    return base64Encode(buf, SHA_DIGEST_LENGTH);
+}
+
 static inline unsigned long long mono()
 {
     timespec ts;
@@ -555,7 +657,7 @@ void WebSocket::createWSContext()
     wslay_event_callbacks callbacks = { wsRecv, wsSend, wsGenMask, nullptr, nullptr, nullptr, wsOnMessage };
     wslay_event_context *context = nullptr;
     const int err = wslay_event_context_client_init(&context, &callbacks, this);
-    assert(err);
+    assert(!err);
 }
 
 ssize_t WebSocket::wsSend(wslay_event_context *ctx, const uint8_t *data, size_t len, int flags, void *user_data)
@@ -573,4 +675,3 @@ void WebSocket::wsOnMessage(wslay_event_context *, const wslay_event_on_msg_recv
 int WebSocket::wsGenMask(wslay_event_context *ctx, uint8_t *buf, size_t len, void *user_data)
 {
 }
-

@@ -80,6 +80,7 @@ int main(int argc, char **argv)
         printf("Calling select maxFd: %d, timeout: %llu\n",
                maxFd + 1, timeout);
         EINTRWRAP(ret, ::select(maxFd + 1, &r, &w, nullptr, &t));
+        printf("Select returned %d %d %s\n", ret, errno, strerror(errno));
         websocket.processSelect(ret, r, w);
         printf("state is %d\n", websocket.state());
     }
