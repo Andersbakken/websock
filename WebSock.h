@@ -1,12 +1,16 @@
 #ifndef WEBSOCK_H
 #define WEBSOCK_H
 
-#include <openssl/ssl.h>
-#include <string>
-#include <sys/socket.h>
-#include <unordered_map>
-#include <wslay/wslay.h>
+#include <functional>
 #include <limits>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <sys/socket.h>
+
+#include <openssl/ssl.h>
+#include <wslay/wslay.h>
 
 #define EINTRWRAP(ret, op)                      \
     do {                                        \
@@ -18,15 +22,37 @@ class WebSocket
 public:
     WebSocket();
     virtual ~WebSocket();
+
+    struct MessageEvent {
+        std::string text;
+        std::vector<unsigned char> binary;
+    };
+
+    struct CloseEvent {
+        int statusCode { 1005 };
+        std::string reason;
+        bool wasClean { true };
+    };
+
     struct Options {
         std::string url, cipherlist, truststore, hostname;
         sockaddr_storage sockaddr;
         socklen_t sockaddr_len { 0 };
         unsigned long long connectTimeoutMS { 0 };
-        time_t currentTime { 0 };
+        time_t currentTime { 0 }; // for ssl
         std::unordered_map<std::string, std::string> headers;
+        std::function<void(WebSocket *, MessageEvent &&message)> onMessage;
+        std::function<void(WebSocket *, CloseEvent &&closeEvent)> onClose;
+        std::function<void(WebSocket *, std::string &&error)> onError;
     };
+
     bool connect(const Options &conn, std::string *err);
+    void send(const std::string &text);
+    void send(const std::vector<unsigned char> &binary);
+    bool close(int code = 1005, const std::string &reaason = std::string());
+    void prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long long &timeout);
+    void processSelect(int count, const fd_set &r, const fd_set &w);
+    void wakeup();
 
     enum State {
         Unset,
@@ -37,23 +63,21 @@ public:
         Closed,
         Error
     };
+
     static const char *stateToString(State state);
     State state() const { return mState; }
-
-    void prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long long &timeout);
-    void processSelect(int count, const fd_set &r, const fd_set &w);
-    void wakeup();
 private:
     std::string createUpgradeRequest();
+    void acceptUpgrade();
     void addToWriteBuffer(const void *data, size_t len);
     void writeSocketBuffer();
-    void acceptUpgrade();
+
     void createSSL();
     void sslConnect(int count, const fd_set &r, const fd_set &w);
-    void createWSContext();
     static int sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx);
     static void sslCtxInfoCallback(const SSL *ssl, int where, int ret);
 
+    void createWSContext();
     static ssize_t wsSend(wslay_event_context *ctx, const uint8_t *data, size_t len, int flags, void *user_data);
     static ssize_t wsRecv(wslay_event_context *ctx, uint8_t *data, size_t len, int flags, void *user_data);
     static void wsOnMessage(wslay_event_context *, const wslay_event_on_msg_recv_arg *arg, void *user_data);

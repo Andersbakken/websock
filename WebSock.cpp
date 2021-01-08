@@ -23,33 +23,14 @@
 # define PRINTF_ATTR(x,y) __attribute__ ((__format__ (__printf__, x, y)))
 #endif
 
-namespace Utils {
-inline const char *strcasestr(const char *haystack, const char *needle, size_t needleLen = std::string::npos)
-{
-    if (needleLen == std::string::npos)
-        needleLen = strlen(needle);
-    assert(needle);
-    assert(haystack);
-    assert(needleLen);
-    const char c = static_cast<char>(tolower(static_cast<unsigned char>(*needle++)));
-    char sc;
-
-    do {
-        do {
-            if ((sc = *haystack++) == 0)
-                return nullptr;
-        } while (static_cast<char>(tolower(static_cast<unsigned char>(sc))) != c);
-    } while (strncasecmp(haystack, needle, needleLen - 1) != 0);
-    --haystack;
-    return haystack;
+namespace {
+const char *strcasestr_(const char *haystack, const char *needle, size_t needleLen = std::string::npos);
+std::string base64Encode(const unsigned char *in, size_t in_len);
+std::string sha1(const unsigned char *in, size_t len);
+inline unsigned long long mono();
+std::string format(const char *fmt, ...) PRINTF_ATTR(1, 2);
+bool setNonblocking(int fd, std::string *err);
 }
-}
-
-static std::string base64Encode(const unsigned char *in, size_t in_len);
-static std::string sha1(const unsigned char *in, size_t len);
-static inline unsigned long long mono();
-static std::string format(const char *fmt, ...) PRINTF_ATTR(1, 2);
-static bool setNonblocking(int fd, std::string *err);
 
 std::unordered_map<SSL *, WebSocket *> WebSocket::sSockets;
 WebSocket::WebSocket()
@@ -138,6 +119,19 @@ bool WebSocket::connect(const Options &options, std::string *err)
     if (options.connectTimeoutMS != 0)
         mConnectTimeout = mono() + options.connectTimeoutMS;
     return true;
+}
+
+
+void WebSocket::send(const std::string &text)
+{
+}
+
+void WebSocket::send(const std::vector<unsigned char> &binary)
+{
+}
+
+bool WebSocket::close(int code, const std::string &reaason)
+{
 }
 
 void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long long &timeout)
@@ -284,12 +278,91 @@ void WebSocket::wakeup()
     }
 }
 
-int WebSocket::sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
+
+const char *WebSocket::stateToString(State state)
 {
-    printf("Got sslCtxVerifyCallback %d\n", preverify_ok);
-    return 1; //preverify_ok;
+    switch (state) {
+    case Unset: return "Unset";
+    case TCPConnecting: return "TCPConnecting";
+    case SSLConnecting: return "SSLConnecting";
+    case WebSocketConnecting: return "WebSocketConnecting";
+    case Connected: return "Connected";
+    case Closed: return "Closed";
+    case Error: return "Error";
+    }
+    return "";
 }
 
+// private functions
+
+std::string WebSocket::createUpgradeRequest()
+{
+    unsigned char buf[16];
+    RAND_bytes(buf, sizeof(buf));
+    assert(mUpgradeKey.empty());
+    mUpgradeKey = base64Encode(buf, sizeof(buf));
+    const size_t pathIdx = mOptions.url.find('/', 6);
+    std::string req = format("GET %s HTTP/1.1\r\n"
+                             "Host: %s\r\n"
+                             "Upgrade: websocket\r\n"
+                             "Connection: Upgrade\r\n"
+                             "Pragma: no-cache\r\n"
+                             "Cache-Control: no-cache\r\n"
+                             "Sec-WebSocket-Key: %s\r\n"
+                             "Sec-WebSocket-Version: 13\r\n",
+                             pathIdx == std::string::npos ? "/" : mOptions.url.c_str() + pathIdx,
+                             mOptions.hostname.c_str(),
+                             mUpgradeKey.c_str());
+
+    for (const auto &ref : mOptions.headers) {
+        req += ref.first + ": " + ref.second + "\r\n";
+    }
+    req += "\r\n";
+    return req;
+}
+
+void WebSocket::acceptUpgrade()
+{
+    const char *data = mUpgradeResponse.c_str();
+    const char *header = strcasestr_(data + 1, "\nsec-websocket-accept:");
+    if (!header)
+        return;
+    header += 22;
+    while (isspace(static_cast<unsigned char>(*header)))
+        ++header;
+
+    if (!*header) {
+        printf("WS: Invalid header\n");
+        mState = Error;
+        return;
+    }
+
+    const char *headerEnd = strstr(header, "\r\n");
+    if (!headerEnd) {
+        printf("WS: No crlf after Accept\n");
+        mState = Error;
+        return;
+    }
+    while (headerEnd > header && isspace(static_cast<unsigned char>(*(headerEnd - 1))))
+        --headerEnd;
+
+    std::string acceptKey = mUpgradeKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    acceptKey = sha1(reinterpret_cast<const unsigned char *>(acceptKey.c_str()), acceptKey.size());
+
+    if (static_cast<size_t>(headerEnd - header) != acceptKey.size()) {
+        printf("WS: Wrong key length %d %zu\n", static_cast<int>(headerEnd - header), acceptKey.size());
+        mState = Error;
+        return;
+    }
+
+    if (strncmp(header, acceptKey.c_str(), acceptKey.size())) {
+        printf("WS: Wrong key %s %s", acceptKey.c_str(), std::string(header, headerEnd).c_str());
+        mState = Error;
+        return;
+    }
+    printf("Accepted ws handshake\n");
+    mState = Connected;
+}
 
 void WebSocket::addToWriteBuffer(const void *data, size_t len)
 {
@@ -330,49 +403,6 @@ void WebSocket::writeSocketBuffer()
         mWriteBuffer = reinterpret_cast<unsigned char *>(realloc(mWriteBuffer, remaining));
         mWriteBufferSize = remaining;
     }
-}
-
-void WebSocket::acceptUpgrade()
-{
-    const char *data = mUpgradeResponse.c_str();
-    const char *header = Utils::strcasestr(data + 1, "\nsec-websocket-accept:");
-    if (!header)
-        return;
-    header += 22;
-    while (isspace(static_cast<unsigned char>(*header)))
-        ++header;
-
-    if (!*header) {
-        printf("WS: Invalid header\n");
-        mState = Error;
-        return;
-    }
-
-    const char *headerEnd = strstr(header, "\r\n");
-    if (!headerEnd) {
-        printf("WS: No crlf after Accept\n");
-        mState = Error;
-        return;
-    }
-    while (headerEnd > header && isspace(static_cast<unsigned char>(*(headerEnd - 1))))
-        --headerEnd;
-
-    std::string acceptKey = mUpgradeKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-    acceptKey = sha1(reinterpret_cast<const unsigned char *>(acceptKey.c_str()), acceptKey.size());
-
-    if (static_cast<size_t>(headerEnd - header) != acceptKey.size()) {
-        printf("WS: Wrong key length %d %zu\n", static_cast<int>(headerEnd - header), acceptKey.size());
-        mState = Error;
-        return;
-    }
-
-    if (strncmp(header, acceptKey.c_str(), acceptKey.size())) {
-        printf("WS: Wrong key %s %s", acceptKey.c_str(), std::string(header, headerEnd).c_str());
-        mState = Error;
-        return;
-    }
-    printf("Accepted ws handshake\n");
-    mState = Connected;
 }
 
 void WebSocket::createSSL()
@@ -500,18 +530,10 @@ void WebSocket::sslConnect(int count, const fd_set &r, const fd_set &w)
     }
 }
 
-const char *WebSocket::stateToString(State state)
+int WebSocket::sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
 {
-    switch (state) {
-    case Unset: return "Unset";
-    case TCPConnecting: return "TCPConnecting";
-    case SSLConnecting: return "SSLConnecting";
-    case WebSocketConnecting: return "WebSocketConnecting";
-    case Connected: return "Connected";
-    case Closed: return "Closed";
-    case Error: return "Error";
-    }
-    return "";
+    printf("Got sslCtxVerifyCallback %d\n", preverify_ok);
+    return 1; //preverify_ok;
 }
 
 void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
@@ -546,35 +568,56 @@ void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
     }
 }
 
-std::string WebSocket::createUpgradeRequest()
-{
-    unsigned char buf[16];
-    RAND_bytes(buf, sizeof(buf));
-    assert(mUpgradeKey.empty());
-    mUpgradeKey = base64Encode(buf, sizeof(buf));
-    const size_t pathIdx = mOptions.url.find('/', 6);
-    std::string req = format("GET %s HTTP/1.1\r\n"
-                             "Host: %s\r\n"
-                             "Upgrade: websocket\r\n"
-                             "Connection: Upgrade\r\n"
-                             "Pragma: no-cache\r\n"
-                             "Cache-Control: no-cache\r\n"
-                             "Sec-WebSocket-Key: %s\r\n"
-                             "Sec-WebSocket-Version: 13\r\n",
-                             pathIdx == std::string::npos ? "/" : mOptions.url.c_str() + pathIdx,
-                             mOptions.hostname.c_str(),
-                             mUpgradeKey.c_str());
 
-    for (const auto &ref : mOptions.headers) {
-        req += ref.first + ": " + ref.second + "\r\n";
-    }
-    req += "\r\n";
-    return req;
+void WebSocket::createWSContext()
+{
+    assert(!mWSContext);
+    wslay_event_callbacks callbacks = { wsRecv, wsSend, wsGenMask, nullptr, nullptr, nullptr, wsOnMessage };
+    wslay_event_context *context = nullptr;
+    const int err = wslay_event_context_client_init(&context, &callbacks, this);
+    assert(!err);
+}
+
+ssize_t WebSocket::wsSend(wslay_event_context *ctx, const uint8_t *data, size_t len, int flags, void *user_data)
+{
+}
+
+ssize_t WebSocket::wsRecv(wslay_event_context *ctx, uint8_t *data, size_t len, int flags, void *user_data)
+{
+}
+
+void WebSocket::wsOnMessage(wslay_event_context *, const wslay_event_on_msg_recv_arg *arg, void *user_data)
+{
+}
+
+int WebSocket::wsGenMask(wslay_event_context *ctx, uint8_t *buf, size_t len, void *user_data)
+{
 }
 
 // ----------------------
 
-static std::string base64Encode(const unsigned char* in, size_t in_len)
+namespace {
+const char *strcasestr_(const char *haystack, const char *needle, size_t needleLen)
+{
+    if (needleLen == std::string::npos)
+        needleLen = strlen(needle);
+    assert(needle);
+    assert(haystack);
+    assert(needleLen);
+    const char c = static_cast<char>(tolower(static_cast<unsigned char>(*needle++)));
+    char sc;
+
+    do {
+        do {
+            if ((sc = *haystack++) == 0)
+                return nullptr;
+        } while (static_cast<char>(tolower(static_cast<unsigned char>(sc))) != c);
+    } while (strncasecmp(haystack, needle, needleLen - 1) != 0);
+    --haystack;
+    return haystack;
+}
+
+std::string base64Encode(const unsigned char* in, size_t in_len)
 {
     BIO *buff, *b64f;
     BUF_MEM *ptr;
@@ -607,7 +650,7 @@ std::string sha1(const unsigned char *in, size_t in_len) // returns base 64 of t
     return base64Encode(buf, SHA_DIGEST_LENGTH);
 }
 
-static inline unsigned long long mono()
+unsigned long long mono()
 {
     timespec ts;
 #if defined(__APPLE__)
@@ -628,7 +671,7 @@ static inline unsigned long long mono()
     return (static_cast<unsigned long long>(ts.tv_sec) * 1000ull) + (static_cast<unsigned long long>(ts.tv_nsec) / 1000000ull);
 }
 
-static std::string format(const char *fmt, ...)
+std::string format(const char *fmt, ...)
 {
     va_list va;
     va_start(va, fmt);
@@ -642,7 +685,7 @@ static std::string format(const char *fmt, ...)
     return std::string(buf, w);
 }
 
-static bool setNonblocking(int fd, std::string *err)
+bool setNonblocking(int fd, std::string *err)
 {
     int ret;
     EINTRWRAP(ret, ::fcntl(fd, F_GETFL));
@@ -662,28 +705,4 @@ static bool setNonblocking(int fd, std::string *err)
 
     return true;
 }
-
-void WebSocket::createWSContext()
-{
-    assert(!mWSContext);
-    wslay_event_callbacks callbacks = { wsRecv, wsSend, wsGenMask, nullptr, nullptr, nullptr, wsOnMessage };
-    wslay_event_context *context = nullptr;
-    const int err = wslay_event_context_client_init(&context, &callbacks, this);
-    assert(!err);
-}
-
-ssize_t WebSocket::wsSend(wslay_event_context *ctx, const uint8_t *data, size_t len, int flags, void *user_data)
-{
-}
-
-ssize_t WebSocket::wsRecv(wslay_event_context *ctx, uint8_t *data, size_t len, int flags, void *user_data)
-{
-}
-
-void WebSocket::wsOnMessage(wslay_event_context *, const wslay_event_on_msg_recv_arg *arg, void *user_data)
-{
-}
-
-int WebSocket::wsGenMask(wslay_event_context *ctx, uint8_t *buf, size_t len, void *user_data)
-{
 }

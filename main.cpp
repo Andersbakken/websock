@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include <string>
 #include <sys/socket.h>
 #include "truststore.cpp"
