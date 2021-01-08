@@ -17,6 +17,12 @@
         ret = op;                               \
     } while (ret == -1 && errno == EINTR)
 
+#if 0
+#define trace(...) trace(__VA_ARGS__)
+#else
+#define trace(...)
+#endif
+
 class WebSocket
 {
 public:
@@ -98,7 +104,7 @@ private:
     SSL *mSSL { nullptr };
     int mPipe[2] { -1, -1 };
     bool mWokenUp { false };
-    wslay_event_context *mWSContext { nullptr };
+    wslay_event_context *mContext { nullptr };
     std::string mUpgradeKey, mUpgradeResponse;
     std::vector<unsigned char> mWriteBuffer, mRecvBuffer;
     bool mWss { false };

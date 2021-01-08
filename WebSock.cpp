@@ -88,7 +88,7 @@ bool WebSocket::connect(const Options &options, std::string *err)
 
     int ret;
     EINTRWRAP(ret, ::connect(mFD, reinterpret_cast<const struct sockaddr *>(&options.sockaddr), options.sockaddr_len));
-    printf("connect returned %d -> %d %s\n", ret, errno, strerror(errno));
+    trace("connect returned %d -> %d %s\n", ret, errno, strerror(errno));
     if (ret == -1) {
         if (errno == EINPROGRESS) {
             mState = TCPConnecting;
@@ -99,7 +99,7 @@ bool WebSocket::connect(const Options &options, std::string *err)
             return false;
         }
     } else {
-        printf("TCP Connected!\n");
+        trace("TCP Connected!\n");
         mState = mWss ? SSLConnecting : WebSocketConnecting;
     }
 
@@ -121,22 +121,40 @@ bool WebSocket::connect(const Options &options, std::string *err)
     return true;
 }
 
-
 void WebSocket::send(const std::string &text)
 {
+    wslay_event_msg wmsg = {
+        WSLAY_TEXT_FRAME,
+        reinterpret_cast<const unsigned char *>(text.c_str()),
+        text.size()
+    };
+    // ### handle error somehow?
+    if (wslay_event_queue_msg(mContext, &wmsg))
+        wslay_event_send(mContext);
 }
 
 void WebSocket::send(const std::vector<unsigned char> &binary)
 {
+    wslay_event_msg wmsg = {
+        WSLAY_BINARY_FRAME,
+        binary.empty() ? nullptr : &binary[0],
+        binary.size()
+    };
+    // ### handle error somehow?
+    if (wslay_event_queue_msg(mContext, &wmsg))
+        wslay_event_send(mContext);
 }
 
-bool WebSocket::close(uint16_t code, const std::string &reaason)
+bool WebSocket::close(uint16_t statusCode, const std::string &reason)
 {
+    return (!wslay_event_queue_close(mContext, statusCode,
+                                     reinterpret_cast<const unsigned char *>(reason.c_str()), reason.size()) &&
+            !wslay_event_send(mContext));
 }
 
 void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long long &timeout)
 {
-    printf("prepareSelect %s\n", stateToString(mState));
+    trace("prepareSelect %s\n", stateToString(mState));
     switch (mState) {
     case Unset:
     case Error:
@@ -159,10 +177,9 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
         break;
     case Connected:
         FD_SET(mFD, &r);
-        if (!mWSContext) {
+        if (!mContext) {
             createWSContext();
         }
-
         break;
     }
     if (!mWriteBuffer.empty()) {
@@ -174,7 +191,7 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
 void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
 {
     mWokenUp = false;
-    printf("processSelect %s count: %d - read: %d write: %d - pipe: %d\n", stateToString(mState),
+    trace("processSelect %s count: %d - read: %d write: %d - pipe: %d\n", stateToString(mState),
            count, FD_ISSET(mFD, &r), FD_ISSET(mFD, &r), FD_ISSET(mPipe[0], &r));
 
     if (FD_ISSET(mPipe[0], &r)) {
@@ -205,7 +222,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
                 break;
             case EISCONN:
             case 0:
-                printf("TCP CONNECTED!\n");
+                trace("TCP CONNECTED!\n");
                 if (mWss) {
                     mState = SSLConnecting;
                 } else {
@@ -248,7 +265,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
                 EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
                 if (r == -1) {
                     if (errno != EWOULDBLOCK && errno != EAGAIN) {
-                        printf("Got an error reading: %d %s\n",
+                        trace("Got an error reading: %d %s\n",
                                errno, strerror(errno));
                         mState = Error;
                     }
@@ -263,8 +280,48 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
             }
         }
         break; }
-    case Connected:
-        break;
+    case Connected: {
+        const bool wasEmpty = mWriteBuffer.empty();
+        if (FD_ISSET(mFD, &r)) {
+            char buf[1024];
+            while (true) {
+                int r;
+                EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
+                if (r == -1) {
+                    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                        trace("Got an error reading: %d %s\n",
+                               errno, strerror(errno));
+                        mState = Error;
+                    }
+                    break;
+                } else if (!r) {
+                    mState = Closed;
+                    break;
+                } else {
+                    const size_t size = mRecvBuffer.size();
+                    mRecvBuffer.resize(mRecvBuffer.size() + r);
+                    memcpy(&mRecvBuffer[size], buf, r);
+                }
+            }
+            if (mState == Connected) {
+                size_t old;
+                do {
+                    old = mWriteBuffer.size();
+                    const int err = wslay_event_recv(mContext);
+                    if (err < 0) {
+                        trace("Something failed in wslay for %d closing %d (had %zu bytes, now has %zu bytes)",
+                               mFD, err, old, mRecvBuffer.size());
+                        mState = Error;
+                        break;
+                    }
+                } while (mRecvBuffer.size() && old != mRecvBuffer.size());
+            }
+        }
+        if (FD_ISSET(mFD, &w) || (wasEmpty && !mWriteBuffer.empty())) {
+            writeSocketBuffer();
+        }
+
+        break; }
     }
 }
 
@@ -277,7 +334,6 @@ void WebSocket::wakeup()
         EINTRWRAP(ret, ::write(mPipe[1], "w", 1));
     }
 }
-
 
 const char *WebSocket::stateToString(State state)
 {
@@ -332,14 +388,14 @@ void WebSocket::acceptUpgrade()
         ++header;
 
     if (!*header) {
-        printf("WS: Invalid header\n");
+        trace("WS: Invalid header\n");
         mState = Error;
         return;
     }
 
     const char *headerEnd = strstr(header, "\r\n");
     if (!headerEnd) {
-        printf("WS: No crlf after Accept\n");
+        trace("WS: No crlf after Accept\n");
         mState = Error;
         return;
     }
@@ -350,17 +406,17 @@ void WebSocket::acceptUpgrade()
     acceptKey = sha1(reinterpret_cast<const unsigned char *>(acceptKey.c_str()), acceptKey.size());
 
     if (static_cast<size_t>(headerEnd - header) != acceptKey.size()) {
-        printf("WS: Wrong key length %d %zu\n", static_cast<int>(headerEnd - header), acceptKey.size());
+        trace("WS: Wrong key length %d %zu\n", static_cast<int>(headerEnd - header), acceptKey.size());
         mState = Error;
         return;
     }
 
     if (strncmp(header, acceptKey.c_str(), acceptKey.size())) {
-        printf("WS: Wrong key %s %s", acceptKey.c_str(), std::string(header, headerEnd).c_str());
+        trace("WS: Wrong key %s %s", acceptKey.c_str(), std::string(header, headerEnd).c_str());
         mState = Error;
         return;
     }
-    printf("Accepted ws handshake\n");
+    trace("Accepted ws handshake\n");
     mState = Connected;
 }
 
@@ -375,7 +431,7 @@ void WebSocket::addToWriteBuffer(const void *data, size_t len)
 
 void WebSocket::writeSocketBuffer()
 {
-    printf("writeSocketBuffer %zu\n", mWriteBuffer.size());
+    trace("writeSocketBuffer %zu\n", mWriteBuffer.size());
     assert(!mWriteBuffer.empty());
     size_t written = 0;
     do {
@@ -385,7 +441,7 @@ void WebSocket::writeSocketBuffer()
         EINTRWRAP(w, ::write(mFD, data + written, mWriteBuffer.size() - written));
         if (w == -1) {
             if (errno != EWOULDBLOCK && errno != EAGAIN) {
-                printf("Got an error writing: %d %s\n",
+                trace("Got an error writing: %d %s\n",
                        errno, strerror(errno));
                 mState = Error;
             }
@@ -423,7 +479,7 @@ void WebSocket::createSSL()
         assert(b);
         while (true) {
             X509 *x509 = PEM_read_bio_X509(b, 0, 0, 0);
-            printf("GOT HELLA X509 %p\n", x509);
+            trace("GOT HELLA X509 %p\n", x509);
             if (!x509)
                 break;
             X509_STORE_add_cert(store, x509);
@@ -458,7 +514,7 @@ void WebSocket::createSSL()
 
 void WebSocket::sslConnect(int count, const fd_set &r, const fd_set &w)
 {
-    printf("sslConnect flags: 0x%x - read: %d (%d) write: %d\n", mFlags,
+    trace("sslConnect flags: 0x%x - read: %d (%d) write: %d\n", mFlags,
            FD_ISSET(mFD, &r),
            FD_ISSET(mFD, &r) ? ([](int fd) -> int {
                int available;
@@ -471,50 +527,50 @@ void WebSocket::sslConnect(int count, const fd_set &r, const fd_set &w)
         ERR_clear_error();
         mFlags &= ~(ConnectWantWrite|ConnectWantRead);
         const int connect = SSL_connect(mSSL);
-        printf("CALLED CONNECT %d\n", connect);
+        trace("CALLED CONNECT %d\n", connect);
         if (connect <= 0) {
             const int sslErr = SSL_get_error(mSSL, connect);
             switch (sslErr) {
             case SSL_ERROR_NONE:
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_NONE:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_NONE:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_ZERO_RETURN:
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_ZERO_RETURN:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_ZERO_RETURN:\n", __LINE__); fflush(stdout);
                 mState = Closed;
                 break;
             case SSL_ERROR_WANT_READ:
                 mFlags |= ConnectWantRead;
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_WANT_READ:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_READ:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_WANT_WRITE:
                 mFlags |= ConnectWantWrite;
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_WANT_WRITE:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_WRITE:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_WANT_CONNECT:
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CONNECT:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CONNECT:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_WANT_ACCEPT:
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ACCEPT:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ACCEPT:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_WANT_ASYNC_JOB:
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ASYNC_JOB:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ASYNC_JOB:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_WANT_CLIENT_HELLO_CB:
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CLIENT_HELLO_CB:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CLIENT_HELLO_CB:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_SYSCALL:
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_SYSCALL:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_SYSCALL:\n", __LINE__); fflush(stdout);
                 mState = Error;
                 break;
             case SSL_ERROR_SSL:
-                printf("[WebSock.cpp:%d]: case SSL_ERROR_SSL:\n", __LINE__); fflush(stdout);
+                trace("[WebSock.cpp:%d]: case SSL_ERROR_SSL:\n", __LINE__); fflush(stdout);
                 mState = Error;
                 break;
             default:
                 break;
             }
 
-            printf("GOT SSL ERR %d\n", sslErr);
+            trace("GOT SSL ERR %d\n", sslErr);
         } else {
             assert(connect == 1);
             mState = WebSocketConnecting;
@@ -525,7 +581,7 @@ void WebSocket::sslConnect(int count, const fd_set &r, const fd_set &w)
 
 int WebSocket::sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
 {
-    printf("Got sslCtxVerifyCallback %d\n", preverify_ok);
+    trace("Got sslCtxVerifyCallback %d\n", preverify_ok);
     return 1; //preverify_ok;
 }
 
@@ -544,19 +600,19 @@ void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
     }
 
     if (where & SSL_CB_HANDSHAKE_DONE) {
-        printf("[WEBSOCK SSL] - %s: handshake done session %sreused\n", sock->mOptions.url.c_str(),
+        trace("[WEBSOCK SSL] - %s: handshake done session %sreused\n", sock->mOptions.url.c_str(),
                SSL_session_reused(const_cast<SSL *>(ssl)) ? "" : "not ");
         // data->metrics.setSSLMode(SSL_session_reused(const_cast<SSL *>(ssl)) ? NetworkMetrics::SSLResumed : NetworkMetrics::SSL);
     }
 
     if (where & SSL_CB_LOOP) {
-        printf("[WEBSOCK SSL] - %s: %s:%s\n", sock->mOptions.url.c_str(), str, SSL_state_string_long(ssl));
+        trace("[WEBSOCK SSL] - %s: %s:%s\n", sock->mOptions.url.c_str(), str, SSL_state_string_long(ssl));
     } else if (where & SSL_CB_ALERT) {
-        printf("[WEBSOCK SSL] - %s: SSL3 alert %s:%s:%s\n", sock->mOptions.url.c_str(),
+        trace("[WEBSOCK SSL] - %s: SSL3 alert %s:%s:%s\n", sock->mOptions.url.c_str(),
                str, SSL_alert_type_string_long(ret),
                SSL_alert_desc_string_long(ret));
     } else if (where & SSL_CB_EXIT && ret <= 0) {
-        printf("[WEBSOCK SSL] - %s: %s:%s in %s\n", sock->mOptions.url.c_str(), str, ret ? "error" : "failed",
+        trace("[WEBSOCK SSL] - %s: %s:%s in %s\n", sock->mOptions.url.c_str(), str, ret ? "error" : "failed",
                SSL_state_string_long(ssl));
     }
 }
@@ -564,10 +620,9 @@ void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
 
 void WebSocket::createWSContext()
 {
-    assert(!mWSContext);
+    assert(!mContext);
     wslay_event_callbacks callbacks = { wsRecv, wsSend, wsGenMask, nullptr, nullptr, nullptr, wsOnMessage };
-    wslay_event_context *context = nullptr;
-    const int err = wslay_event_context_client_init(&context, &callbacks, this);
+    const int err = wslay_event_context_client_init(&mContext, &callbacks, this);
     assert(!err);
 }
 
@@ -575,7 +630,7 @@ ssize_t WebSocket::wsSend(wslay_event_context *ctx, const uint8_t *data, size_t 
 {
     WebSocket *that = static_cast<WebSocket *>(user_data);
     that->addToWriteBuffer(data, len);
-    printf("Sending %zu bytes of data for ws: %d", len, that->mFD);
+    trace("Sending %zu bytes of data for ws: %d\n", len, that->mFD);
     return len;
 }
 
@@ -588,7 +643,7 @@ ssize_t WebSocket::wsRecv(wslay_event_context *ctx, uint8_t *data, size_t len, i
     }
     const size_t ret = std::min(len, that->mRecvBuffer.size());
     memcpy(data, &that->mRecvBuffer[0], ret);
-    // printf("Read %zd bytes:\n%s", ret, hexDump(data, ret));
+    // trace("Read %zd bytes:\n%s", ret, hexDump(data, ret));
 
     that->mRecvBuffer.erase(that->mRecvBuffer.begin(), that->mRecvBuffer.begin() + ret);
     return ret;
@@ -597,28 +652,30 @@ ssize_t WebSocket::wsRecv(wslay_event_context *ctx, uint8_t *data, size_t len, i
 void WebSocket::wsOnMessage(wslay_event_context *, const wslay_event_on_msg_recv_arg *arg, void *user_data)
 {
     WebSocket *that = static_cast<WebSocket *>(user_data);
-    printf("WebSocket %d got a message opcode: 0x%x bytes: %zu\n",
+    trace("WebSocket %d got a message opcode: 0x%x bytes: %zu\n",
            that->mFD, arg->opcode, arg->msg_length);
     switch (static_cast<wslay_opcode>(arg->opcode)) {
     case WSLAY_CONNECTION_CLOSE:
-        // printf("Got close from server: statusCode: %d reason: \"%s\"",
+        // trace("Got close from server: statusCode: %d reason: \"%s\"",
         //        arg->status_code, ResourceManager::logString(arg->msg_length > 2 ? reinterpret_cast<const char *>(arg->msg) + 2 : "",
         //                                                     arg->msg_length > 2 ? arg->msg_length - 2 : 0));
         that->mState = Closed;
         if (that->mOptions.onClose) {
             CloseEvent event;
             event.statusCode = arg->status_code;
-            if (arg->msg_length) {
-                event.reason.assign(reinterpret_cast<const char *>(arg->msg), arg->msg_length);
+            // the first two bytes are the status code and wslay leaves them in
+            // the message for some reason
+            if (arg->msg_length > 2) {
+                event.reason.assign(reinterpret_cast<const char *>(arg->msg) + 2, arg->msg_length - 2);
             }
             that->mOptions.onClose(that, std::move(event));
         }
-        wslay_event_send(that->mWSContext);
+        wslay_event_send(that->mContext);
         break;
     case WSLAY_PING:
     case WSLAY_PONG:
     case WSLAY_CONTINUATION_FRAME: {
-        wslay_event_send(that->mWSContext);
+        wslay_event_send(that->mContext);
         break; }
     case WSLAY_TEXT_FRAME:
     case WSLAY_BINARY_FRAME:

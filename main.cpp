@@ -17,6 +17,30 @@ int main(int argc, char **argv)
         options.url = argv[1];
     }
     options.connectTimeoutMS = 8000;
+    options.onMessage = [](WebSocket *, WebSocket::MessageEvent &&event) {
+        printf("GOT MESSAGE EVENT %s %d\n", event.text.empty() ? "binary" : "text", event.statusCode);
+        if (event.text.empty()) {
+            for (size_t i=0; i<event.binary.size(); ++i) {
+                if (i) {
+                    printf(" 0x%02x", event.binary[i]);
+                    if (i % 16 == 0)
+                        printf("\n");
+                } else {
+                    printf("0x%02x", event.binary[i]);
+                }
+                if (i % 16 != 0) {
+                    printf("\n");
+                }
+            }
+        } else {
+            printf("%s\n", event.text.c_str());
+        }
+    };
+
+    options.onClose = [](WebSocket *, WebSocket::CloseEvent &&event) {
+        printf("GOT CLOSE EVENT %s %d %s\n", event.wasClean ? "clean" : "dirty",
+               event.statusCode, event.reason.c_str());
+    };
     std::string err;
     bool wss;
 
@@ -41,7 +65,7 @@ int main(int argc, char **argv)
     }
     options.hostname = options.url.substr(start + 3, end - start - 3);
     options.truststore = truststore;
-    printf("hostname [%s]\n", options.hostname.c_str());
+    trace("hostname [%s]\n", options.hostname.c_str());
 
     hostent *host = gethostbyname(options.hostname.c_str());
     if (!host || !host->h_addr_list || !host->h_addr_list[0]) {
@@ -50,7 +74,7 @@ int main(int argc, char **argv)
     }
 
     for (size_t i = 0; host->h_addr_list[i]; ++i) {
-        printf("%s %d\n", inet_ntoa(*(struct in_addr *)(host->h_addr_list[i])), host->h_length);
+        trace("%s %d\n", inet_ntoa(*(struct in_addr *)(host->h_addr_list[i])), host->h_length);
     }
     memset(&options.sockaddr, 0, sizeof(sockaddr));
     if (host->h_length == 4) {
@@ -81,16 +105,17 @@ int main(int argc, char **argv)
         websocket.prepareSelect(maxFd, r, w, timeout);
         int ret;
         timeval t = { static_cast<time_t>(timeout / 1000), static_cast<suseconds_t>((timeout % 1000) * 1000 ) };
-        printf("Calling select for %s maxFd: %d, timeout: %llu\n",
+        trace("Calling select for %s maxFd: %d, timeout: %llu\n",
                WebSocket::stateToString(websocket.state()), maxFd + 1, timeout);
         EINTRWRAP(ret, ::select(maxFd + 1, &r, &w, nullptr, &t));
-        printf("Select for %s returned %d %d %s\n",
+        trace("Select for %s returned %d %d %s\n",
                WebSocket::stateToString(websocket.state()),
                ret, ret == -1 ? errno : 0, ret == -1 ? strerror(errno) : "");
         websocket.processSelect(ret, r, w);
-        // printf("state is %d\n", websocket.state());
+        // trace("state is %d\n", websocket.state());
         if (!sent && !ret && websocket.state() == WebSocket::Connected) {
             websocket.send("Balls");
+            printf("Sending balls\n");
             sent = true;
         }
     }
