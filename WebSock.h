@@ -26,10 +26,11 @@ public:
     struct MessageEvent {
         std::string text;
         std::vector<unsigned char> binary;
+        uint16_t statusCode { 0 };
     };
 
     struct CloseEvent {
-        int statusCode { 1005 };
+        uint16_t statusCode { 1005 };
         std::string reason;
         bool wasClean { true };
     };
@@ -49,7 +50,7 @@ public:
     bool connect(const Options &conn, std::string *err);
     void send(const std::string &text);
     void send(const std::vector<unsigned char> &binary);
-    bool close(int code = 1005, const std::string &reaason = std::string());
+    bool close(uint16_t code = 1005, const std::string &reaason = std::string());
     void prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long long &timeout);
     void processSelect(int count, const fd_set &r, const fd_set &w);
     void wakeup();
@@ -99,8 +100,7 @@ private:
     bool mWokenUp { false };
     wslay_event_context *mWSContext { nullptr };
     std::string mUpgradeKey, mUpgradeResponse;
-    unsigned char *mWriteBuffer { nullptr };
-    size_t mWriteBufferSize { 0 };
+    std::vector<unsigned char> mWriteBuffer, mRecvBuffer;
     bool mWss { false };
 };
 

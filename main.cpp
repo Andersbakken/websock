@@ -71,11 +71,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    bool sent = false;
     while (websocket.state() != WebSocket::Error && websocket.state() != WebSocket::Closed) {
         fd_set r, w;
         FD_ZERO(&r);
         FD_ZERO(&w);
-        unsigned long long timeout = 100000;
+        unsigned long long timeout = 1000;
         int maxFd = 0;
         websocket.prepareSelect(maxFd, r, w, timeout);
         int ret;
@@ -88,6 +89,10 @@ int main(int argc, char **argv)
                ret, ret == -1 ? errno : 0, ret == -1 ? strerror(errno) : "");
         websocket.processSelect(ret, r, w);
         // printf("state is %d\n", websocket.state());
+        if (!sent && !ret && websocket.state() == WebSocket::Connected) {
+            websocket.send("Balls");
+            sent = true;
+        }
     }
 
     // while (websocket

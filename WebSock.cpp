@@ -130,7 +130,7 @@ void WebSocket::send(const std::vector<unsigned char> &binary)
 {
 }
 
-bool WebSocket::close(int code, const std::string &reaason)
+bool WebSocket::close(uint16_t code, const std::string &reaason)
 {
 }
 
@@ -165,7 +165,7 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
 
         break;
     }
-    if (mWriteBuffer) {
+    if (!mWriteBuffer.empty()) {
         FD_SET(mFD, &w);
     }
     nfds = std::max(nfds, mFD);
@@ -237,7 +237,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
             addToWriteBuffer(req.c_str(), req.size());
         }
 
-        if ((wasEmpty || FD_ISSET(mFD, &w)) && mWriteBuffer) {
+        if ((wasEmpty || FD_ISSET(mFD, &w)) && !mWriteBuffer.empty()) {
             writeSocketBuffer();
         }
 
@@ -367,20 +367,22 @@ void WebSocket::acceptUpgrade()
 void WebSocket::addToWriteBuffer(const void *data, size_t len)
 {
     assert(len);
-    mWriteBuffer = reinterpret_cast<unsigned char *>(realloc(mWriteBuffer, mWriteBufferSize + len));
-    memcpy(mWriteBuffer + mWriteBufferSize, data, len);
-    mWriteBufferSize += len;
+    size_t size = mWriteBuffer.size();
+    mWriteBuffer.resize(size + len);
+    memcpy(&mWriteBuffer[size], data, len);
     wakeup();
 }
 
 void WebSocket::writeSocketBuffer()
 {
-    printf("writeSocketBuffer %zu\n", mWriteBufferSize);
+    printf("writeSocketBuffer %zu\n", mWriteBuffer.size());
+    assert(!mWriteBuffer.empty());
     size_t written = 0;
     do {
         int w;
-        assert(mWriteBufferSize > written);
-        EINTRWRAP(w, ::write(mFD, mWriteBuffer + written, mWriteBufferSize - written));
+        assert(mWriteBuffer.size() > written);
+        const unsigned char *data = &mWriteBuffer[0];
+        EINTRWRAP(w, ::write(mFD, data + written, mWriteBuffer.size() - written));
         if (w == -1) {
             if (errno != EWOULDBLOCK && errno != EAGAIN) {
                 printf("Got an error writing: %d %s\n",
@@ -392,17 +394,8 @@ void WebSocket::writeSocketBuffer()
             assert(w > 0);
             written += w;
         }
-    } while (written < mWriteBufferSize);
-    if (written == mWriteBufferSize) {
-        free(mWriteBuffer);
-        mWriteBuffer = nullptr;
-        mWriteBufferSize = 0;
-    } else if (written) {
-        const size_t remaining = mWriteBufferSize - written;
-        memmove(mWriteBuffer + written, mWriteBuffer, remaining);
-        mWriteBuffer = reinterpret_cast<unsigned char *>(realloc(mWriteBuffer, remaining));
-        mWriteBufferSize = remaining;
-    }
+    } while (written < mWriteBuffer.size());
+    mWriteBuffer.erase(mWriteBuffer.begin(), mWriteBuffer.begin() + written);
 }
 
 void WebSocket::createSSL()
@@ -580,18 +573,77 @@ void WebSocket::createWSContext()
 
 ssize_t WebSocket::wsSend(wslay_event_context *ctx, const uint8_t *data, size_t len, int flags, void *user_data)
 {
+    WebSocket *that = static_cast<WebSocket *>(user_data);
+    that->addToWriteBuffer(data, len);
+    printf("Sending %zu bytes of data for ws: %d", len, that->mFD);
+    return len;
 }
 
 ssize_t WebSocket::wsRecv(wslay_event_context *ctx, uint8_t *data, size_t len, int flags, void *user_data)
 {
+    WebSocket *that = static_cast<WebSocket *>(user_data);
+    if (that->mRecvBuffer.empty()) {
+        wslay_event_set_error(ctx, WSLAY_ERR_WOULDBLOCK);
+        return -1;
+    }
+    const size_t ret = std::min(len, that->mRecvBuffer.size());
+    memcpy(data, &that->mRecvBuffer[0], ret);
+    // printf("Read %zd bytes:\n%s", ret, hexDump(data, ret));
+
+    that->mRecvBuffer.erase(that->mRecvBuffer.begin(), that->mRecvBuffer.begin() + ret);
+    return ret;
 }
 
 void WebSocket::wsOnMessage(wslay_event_context *, const wslay_event_on_msg_recv_arg *arg, void *user_data)
 {
+    WebSocket *that = static_cast<WebSocket *>(user_data);
+    printf("WebSocket %d got a message opcode: 0x%x bytes: %zu\n",
+           that->mFD, arg->opcode, arg->msg_length);
+    switch (static_cast<wslay_opcode>(arg->opcode)) {
+    case WSLAY_CONNECTION_CLOSE:
+        // printf("Got close from server: statusCode: %d reason: \"%s\"",
+        //        arg->status_code, ResourceManager::logString(arg->msg_length > 2 ? reinterpret_cast<const char *>(arg->msg) + 2 : "",
+        //                                                     arg->msg_length > 2 ? arg->msg_length - 2 : 0));
+        that->mState = Closed;
+        if (that->mOptions.onClose) {
+            CloseEvent event;
+            event.statusCode = arg->status_code;
+            if (arg->msg_length) {
+                event.reason.assign(reinterpret_cast<const char *>(arg->msg), arg->msg_length);
+            }
+            that->mOptions.onClose(that, std::move(event));
+        }
+        wslay_event_send(that->mWSContext);
+        break;
+    case WSLAY_PING:
+    case WSLAY_PONG:
+    case WSLAY_CONTINUATION_FRAME: {
+        wslay_event_send(that->mWSContext);
+        break; }
+    case WSLAY_TEXT_FRAME:
+    case WSLAY_BINARY_FRAME:
+        if (that->mOptions.onMessage) {
+            MessageEvent event;
+            event.statusCode = arg->status_code;
+            if (arg->msg_length) {
+                if (arg->opcode == WSLAY_TEXT_FRAME) {
+                    event.text.assign(reinterpret_cast<const char *>(arg->msg), arg->msg_length);
+                } else {
+                    event.binary.resize(arg->msg_length);
+                    memcpy(&event.binary[0], arg->msg, arg->msg_length);
+                }
+            }
+
+            that->mOptions.onMessage(that, std::move(event));
+        }
+        break;
+    }
 }
 
-int WebSocket::wsGenMask(wslay_event_context *ctx, uint8_t *buf, size_t len, void *user_data)
+int WebSocket::wsGenMask(wslay_event_context */*ctx*/, uint8_t *buf, size_t len, void */*user_data*/)
 {
+    RAND_bytes(buf, len);
+    return 0;
 }
 
 // ----------------------
