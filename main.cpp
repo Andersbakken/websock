@@ -18,19 +18,25 @@ int main(int argc, char **argv)
     std::string err;
     bool wss;
 
+    uint16_t port;
     if (!strncmp(options.url.c_str(), "wss://", 6)) {
         wss = true;
+        port = 443;
     } else if (!strncmp(options.url.c_str(), "ws://", 5)) {
         wss = false;
+        port = 80;
     } else {
         fprintf(stderr, "Invalid url\n");
         return 1;
     }
 
     const size_t start = wss ? 3 : 2;
-    size_t end = options.url.find("/", start + 3);
-    if (end == std::string::npos)
-        end = options.url.size();
+    const size_t colon = options.url.find(":", start + 3);
+    size_t end = std::min(options.url.size(), options.url.find("/", start + 3));
+    if (colon < end) {
+        end = colon;
+        port = atoi(options.url.c_str() + colon + 1);
+    }
     options.hostname = options.url.substr(start + 3, end - start - 3);
     printf("hostname [%s]\n", options.hostname.c_str());
 
@@ -49,7 +55,7 @@ int main(int argc, char **argv)
         sockaddr_in &in = reinterpret_cast<sockaddr_in &>(options.sockaddr);
         memcpy(&in.sin_addr.s_addr, reinterpret_cast<struct in_addr *>(host->h_addr_list[0]), host->h_length);
         in.sin_family = AF_INET;
-        in.sin_port = htons(wss ? 443 : 80);
+        in.sin_port = htons(port);
     } else {
         fprintf(stderr, "ipv6 not implented yet\n");
         return 1;
@@ -71,6 +77,8 @@ int main(int argc, char **argv)
         websocket.prepareSelect(maxFd, r, w, timeout);
         int ret;
         timeval t = { static_cast<time_t>(timeout / 1000), static_cast<suseconds_t>((timeout % 1000) * 1000 ) };
+        printf("Calling select maxFd: %d, timeout: %llu\n",
+               maxFd + 1, timeout);
         EINTRWRAP(ret, ::select(maxFd + 1, &r, &w, nullptr, &t));
         websocket.processSelect(ret, r, w);
         printf("state is %d\n", websocket.state());
