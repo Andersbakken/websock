@@ -1,16 +1,18 @@
 #include "WebSock.h"
 
-#include <sys/types.h>
-#include <unistd.h>
+#include <algorithm>
+#include <assert.h>
+#include <cctype>
 #include <fcntl.h>
+#include <functional>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <pthread.h>
-#include <algorithm>
 #include <string.h>
-#include <cctype>
-#include <functional>
-#include <assert.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -185,6 +187,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
         char buf;
         int r;
         EINTRWRAP(r, ::read(mPipe[0], &buf, 1));
+        --count;
     }
     switch (mState) {
     case Unset:
@@ -284,7 +287,7 @@ void WebSocket::wakeup()
 int WebSocket::sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
 {
     printf("Got sslCtxVerifyCallback %d\n", preverify_ok);
-    return preverify_ok;
+    return 1; //preverify_ok;
 }
 
 
@@ -432,7 +435,14 @@ void WebSocket::createSSL()
 
 void WebSocket::sslConnect(int count, const fd_set &r, const fd_set &w)
 {
-    printf("HERE 0x%x - %d %d\n", mFlags, FD_ISSET(mFD, &r), FD_ISSET(mFD, &w));
+    printf("sslConnect flags: 0x%x - read: %d (%d) write: %d\n", mFlags,
+           FD_ISSET(mFD, &r),
+           FD_ISSET(mFD, &r) ? ([](int fd) -> int {
+               int available;
+               ioctl(fd, FIONREAD, &available);
+               return available;
+           })(mFD) : -1,
+           FD_ISSET(mFD, &w));
 
     if (FD_ISSET(mFD, &r) || FD_ISSET(mFD, &w)) {
         ERR_clear_error();
