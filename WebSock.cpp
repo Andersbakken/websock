@@ -502,6 +502,7 @@ void WebSocket::createSSL()
             if (!x509)
                 break;
             X509_STORE_add_cert(store, x509);
+            X509_free(x509);
         }
         BIO_free(b);
     }
