@@ -100,14 +100,15 @@ int main(int argc, char **argv)
         fd_set r, w;
         FD_ZERO(&r);
         FD_ZERO(&w);
-        unsigned long long timeout = 1000;
+        unsigned long long timeout = sent ? std::numeric_limits<unsigned long long>::max() : 1000;
         int maxFd = 0;
         websocket.prepareSelect(maxFd, r, w, timeout);
         int ret;
         timeval t = { static_cast<time_t>(timeout / 1000), static_cast<suseconds_t>((timeout % 1000) * 1000 ) };
         trace("Calling select for %s maxFd: %d, timeout: %llu\n",
                WebSocket::stateToString(websocket.state()), maxFd + 1, timeout);
-        EINTRWRAP(ret, ::select(maxFd + 1, &r, &w, nullptr, &t));
+        EINTRWRAP(ret, ::select(maxFd + 1, &r, &w, nullptr,
+                                timeout == std::numeric_limits<unsigned long long>::max() ? nullptr : &t));
         trace("Select for %s returned %d %d %s\n",
                WebSocket::stateToString(websocket.state()),
                ret, ret == -1 ? errno : 0, ret == -1 ? strerror(errno) : "");

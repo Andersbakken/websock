@@ -30,6 +30,7 @@ std::string sha1(const unsigned char *in, size_t len);
 inline unsigned long long mono();
 std::string format(const char *fmt, ...) PRINTF_ATTR(1, 2);
 bool setNonblocking(int fd, std::string *err);
+bool isBinary(const void *str, size_t len);
 }
 
 std::unordered_map<SSL *, WebSocket *> WebSocket::sSockets;
@@ -70,9 +71,6 @@ bool WebSocket::connect(const Options &options, std::string *err)
     mOptions = options;
 
     mOptions.url.reserve(options.url.size());
-    std::transform(options.url.begin(), options.url.end(), std::back_inserter(mOptions.url),
-                   [](unsigned char c) { return std::tolower(c); });
-
     mFD = ::socket(options.sockaddr_len == sizeof(sockaddr_in) ? AF_INET : AF_INET6, SOCK_STREAM, 0);
     if (mFD == -1) {
         mState = Error;
@@ -115,7 +113,7 @@ bool WebSocket::connect(const Options &options, std::string *err)
         return false;
     }
 
-    mWss = !strncmp(mOptions.url.c_str(), "wss://", 6);
+    mWss = !strncasecmp(mOptions.url.c_str(), "wss://", 6);
     if (options.connectTimeoutMS != 0)
         mConnectTimeout = mono() + options.connectTimeoutMS;
     return true;
@@ -129,7 +127,7 @@ void WebSocket::send(const std::string &text)
         text.size()
     };
     // ### handle error somehow?
-    if (wslay_event_queue_msg(mContext, &wmsg))
+    if (!wslay_event_queue_msg(mContext, &wmsg))
         wslay_event_send(mContext);
 }
 
@@ -141,7 +139,7 @@ void WebSocket::send(const std::vector<unsigned char> &binary)
         binary.size()
     };
     // ### handle error somehow?
-    if (wslay_event_queue_msg(mContext, &wmsg))
+    if (!wslay_event_queue_msg(mContext, &wmsg))
         wslay_event_send(mContext);
 }
 
@@ -174,6 +172,10 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
         break;
     case WebSocketConnecting:
         FD_SET(mFD, &r);
+        FD_SET(mFD, &w);
+        break;
+    case WebSocketSentUpgrade:
+        FD_SET(mFD, &r);
         break;
     case Connected:
         FD_SET(mFD, &r);
@@ -183,6 +185,7 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
         break;
     }
     if (!mWriteBuffer.empty()) {
+        trace("mWriteBuffer has %zu bytes, selecting for write\n", mWriteBuffer.size());
         FD_SET(mFD, &w);
     }
     nfds = std::max(nfds, mFD);
@@ -246,18 +249,20 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
         }
         sslConnect(count, r, w);
         break;
-    case WebSocketConnecting: {
-        const bool wasEmpty = mUpgradeKey.empty();
-        if (mUpgradeKey.empty()) {
-            std::string req = createUpgradeRequest();
+    case WebSocketConnecting:
+        if (FD_ISSET(mFD, &w)) {
+            assert(mUpgradeKey.empty());
+            const std::string req = createUpgradeRequest();
             assert(!mUpgradeKey.empty());
             addToWriteBuffer(req.c_str(), req.size());
+            writeSocketBuffer();
+            mState = WebSocketSentUpgrade;
         }
-
-        if ((wasEmpty || FD_ISSET(mFD, &w)) && !mWriteBuffer.empty()) {
+        break;
+    case WebSocketSentUpgrade:
+        if (FD_ISSET(mFD, &w) && !mWriteBuffer.empty()) {
             writeSocketBuffer();
         }
-
         if (FD_ISSET(mFD, &r)) {
             char buf[1024];
             while (true) {
@@ -266,7 +271,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
                 if (r == -1) {
                     if (errno != EWOULDBLOCK && errno != EAGAIN) {
                         trace("Got an error reading: %d %s\n",
-                               errno, strerror(errno));
+                              errno, strerror(errno));
                         mState = Error;
                     }
                     break;
@@ -279,7 +284,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
                 }
             }
         }
-        break; }
+        break;
     case Connected: {
         const bool wasEmpty = mWriteBuffer.empty();
         if (FD_ISSET(mFD, &r)) {
@@ -342,6 +347,7 @@ const char *WebSocket::stateToString(State state)
     case TCPConnecting: return "TCPConnecting";
     case SSLConnecting: return "SSLConnecting";
     case WebSocketConnecting: return "WebSocketConnecting";
+    case WebSocketSentUpgrade: return "WebSocketSentUpgrade";
     case Connected: return "Connected";
     case Closed: return "Closed";
     case Error: return "Error";
@@ -444,9 +450,13 @@ void WebSocket::writeSocketBuffer()
                 trace("Got an error writing: %d %s\n",
                        errno, strerror(errno));
                 mState = Error;
+            } else {
+                trace("Got EAGAIN writing %zu bytes\n", mWriteBuffer.size() - written);
             }
             break;
         } else {
+            trace("Wrote %d bytes of %zu\n%s", w, mWriteBuffer.size() - written,
+                  isBinary(data + written, w) ? "" : format("%.*s\n", w, data + written).c_str());
             assert(w > 0);
             written += w;
         }
@@ -813,5 +823,47 @@ bool setNonblocking(int fd, std::string *err)
     }
 
     return true;
+}
+bool isBinary(const void *data, size_t len)
+{
+    const unsigned char *ch = reinterpret_cast<const unsigned char *>(data);
+    for (size_t i = 0; i < len; ++i) {
+        switch (ch[i]) {
+        case 0:
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+        case 8:
+        case 14:
+        case 15:
+        case 16:
+        case 17:
+        case 18:
+        case 19:
+        case 20:
+        case 21:
+        case 22:
+        case 23:
+        case 24:
+        case 25:
+        case 26:
+        case 27:
+        case 28:
+        case 29:
+        case 30:
+        case 31:
+            return true;
+        default:
+            if (ch[i] >= 127) {
+                return true;
+            }
+            break;
+        }
+    }
+    return false;
 }
 }

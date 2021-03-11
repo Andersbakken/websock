@@ -17,8 +17,8 @@
         ret = op;                               \
     } while (ret == -1 && errno == EINTR)
 
-#if 0
-#define trace(...) trace(__VA_ARGS__)
+#if 1
+#define trace(...) printf(__VA_ARGS__)
 #else
 #define trace(...)
 #endif
@@ -66,6 +66,7 @@ public:
         TCPConnecting,
         SSLConnecting,
         WebSocketConnecting,
+        WebSocketSentUpgrade,
         Connected,
         Closed,
         Error
