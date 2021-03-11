@@ -3,6 +3,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
+#include <algorithm>
 #include <string.h>
 #include <unistd.h>
 #include <string>
@@ -14,7 +15,30 @@ int main(int argc, char **argv)
     WebSocket::Options options;
     options.url = "wss://echo.websocket.org";
     for (int i = 1; i < argc; ++i) {
-        options.url = argv[1];
+        if (!strcmp(argv[i], "--truststore")) {
+            if (i + 1 < argc) {
+                FILE *f = fopen(argv[++i], "r");
+                if (!f) {
+                    fprintf(stderr, "Can't open %s for reading\n", argv[i]);
+                    return 1;
+                }
+                fseek(f, 0, SEEK_END);
+                const long size = ftell(f);
+                options.truststore.resize(size);
+                fseek(f, 0, SEEK_SET);
+                if (fread(&options.truststore[0], 1, size, f) != size) {
+                    fprintf(stderr, "Failed to read from %s\n", argv[i]);
+                    fclose(f);
+                    return 1;
+                }
+                fclose(f);
+            } else {
+                fprintf(stderr, "No argument for --truststore\n");
+                return 1;
+            }
+        } else {
+            options.url = argv[1];
+        }
     }
     options.connectTimeoutMS = 8000;
     options.onMessage = [](WebSocket *, WebSocket::MessageEvent &&event) {
@@ -63,8 +87,13 @@ int main(int argc, char **argv)
         end = colon;
         port = atoi(options.url.c_str() + colon + 1);
     }
-    options.hostname = options.url.substr(start + 3, end - start - 3);
-    options.truststore = truststore;
+    std::transform(options.url.begin() + start + 3, options.url.begin() + end,
+                   std::back_inserter(options.hostname),
+                   [](unsigned char c) { return std::tolower(c); });
+
+    // options.hostname = options.url.substr(start + 3, end - start - 3);
+    if (options.truststore.empty())
+        options.truststore = truststore;
     trace("hostname [%s]\n", options.hostname.c_str());
 
     hostent *host = gethostbyname(options.hostname.c_str());

@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <functional>
 #include <netinet/in.h>
+#include <memory>
 #include <netinet/ip.h>
 #include <pthread.h>
 #include <string.h>
@@ -16,6 +17,7 @@
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <openssl/x509v3.h>
 
 #if !defined(__GNUC__) || defined(__ANDROID__)
 # define PRINTF_ATTR(x,y)
@@ -31,6 +33,12 @@ inline unsigned long long mono();
 std::string format(const char *fmt, ...) PRINTF_ATTR(1, 2);
 bool setNonblocking(int fd, std::string *err);
 bool isBinary(const void *str, size_t len);
+int verifyServerName(const std::string &hostname, const X509 *x509);
+bool compareHost(const std::string expected, std::string actual);
+int sslIndex();
+size_t indexOf(const char *haystack, const char *needle);
+std::string join(const std::vector<std::string> &strings, const std::string &delimiter);
+std::vector<std::string> split(const std::string &string, const std::string &splitPattern);
 }
 
 std::unordered_map<SSL *, WebSocket *> WebSocket::sSockets;
@@ -473,6 +481,7 @@ void WebSocket::createSSL()
         mState = Error;
         return;
     }
+    SSL_CTX_set_ex_data(mSSLCtx, sslIndex(), this);
     // ### error checking for all of these
     SSL_CTX_set_min_proto_version(mSSLCtx, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(mSSLCtx, TLS1_3_VERSION);
@@ -592,7 +601,43 @@ void WebSocket::sslConnect(int count, const fd_set &r, const fd_set &w)
 int WebSocket::sslCtxVerifyCallback(int preverify_ok, X509_STORE_CTX *x509_ctx)
 {
     trace("Got sslCtxVerifyCallback %d\n", preverify_ok);
-    return 1; //preverify_ok;
+    if (preverify_ok != 1) {
+        const unsigned long err = X509_STORE_CTX_get_error(x509_ctx);
+        const char *errorString = X509_verify_cert_error_string(err);
+        trace("Got ssl verify error: code: %ld text: %s\n",
+              err, errorString);
+        return preverify_ok;
+    }
+
+    const STACK_OF(X509) *xChain = X509_STORE_CTX_get0_chain(x509_ctx);
+    assert(xChain);
+    if (!xChain) {
+        const unsigned long err = X509_STORE_CTX_get_error(x509_ctx);
+        const char *errorString = X509_verify_cert_error_string(err);
+        trace("Failed to get x509 chain: code: %ld text: %s\n",
+              err, errorString);
+        return 0;
+    }
+
+    const size_t numX509s = sk_X509_num(xChain);
+    if (!numX509s) {
+        const unsigned long err = X509_STORE_CTX_get_error(x509_ctx);
+        const char *errorString = X509_verify_cert_error_string(err);
+        trace("No certs in chain: code: %ld text: %s\n",
+              err, errorString);
+        return 0;
+    }
+
+    const X509 *x509 = sk_X509_value(xChain, 0);
+    assert(x509);
+
+    SSL *ssl = static_cast<SSL*>(X509_STORE_CTX_get_ex_data(x509_ctx, SSL_get_ex_data_X509_STORE_CTX_idx()));
+    assert(ssl);
+    SSL_CTX *sslInitialCtx = SSL_get_SSL_CTX(ssl);
+    WebSocket *webSocket = reinterpret_cast<WebSocket *>(SSL_CTX_get_ex_data(sslInitialCtx, sslIndex()));
+    assert(webSocket);
+    preverify_ok = verifyServerName(webSocket->mOptions.hostname, x509);
+    return preverify_ok;
 }
 
 void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
@@ -865,5 +910,175 @@ bool isBinary(const void *data, size_t len)
         }
     }
     return false;
+}
+
+int verifyServerName(const std::string &expectedName, const X509 *x509)
+{
+    std::unique_ptr<BIO, int(*)(BIO *)> bio(BIO_new(BIO_s_mem()), &BIO_free);
+    X509_NAME *x509_name = X509_get_subject_name(x509);
+
+    char certsubjectname[1024];
+    int certsubjectnameLength = 0;
+
+    if (x509_name && X509_NAME_print_ex(bio.get(), x509_name, 0, XN_FLAG_SEP_COMMA_PLUS) != -1) {
+        certsubjectnameLength = std::max(0, BIO_read(bio.get(), certsubjectname, sizeof(certsubjectname) - 1));
+        if (certsubjectnameLength <= 0) {
+            trace("Failed to get name from X509\n");
+        }
+        certsubjectname[certsubjectnameLength] = '\0';
+    } else {
+        certsubjectname[0] = '\0';
+        trace("Failed to get X509_NAME\n");
+    }
+    std::string cn;
+    if (*certsubjectname) {
+        trace("got certsubjectname %s\n", certsubjectname);
+        const size_t idx  = indexOf(certsubjectname, ",CN=");
+        if (idx != std::numeric_limits<size_t>::max() && idx + 4 < certsubjectnameLength) {
+            size_t trailingComma = indexOf(certsubjectname + idx + 4, ",");
+            if (!trailingComma) {
+                trailingComma = certsubjectnameLength;
+            }
+            cn.assign(certsubjectname + idx + 4, trailingComma);
+            if (compareHost(cn, expectedName)) {
+                return 1;
+            }
+        }
+    }
+
+    std::unique_ptr<STACK_OF(GENERAL_NAME), void(*)(STACK_OF(GENERAL_NAME) *)> altNames(reinterpret_cast<STACK_OF(GENERAL_NAME) *>(X509_get_ext_d2i(x509, NID_subject_alt_name, nullptr, nullptr)),
+                                                                                        &GENERAL_NAMES_free);
+    if (!altNames) {
+        trace("No alt names found\n");
+        if (!cn.empty()) {
+            trace("certificate subject name '%s' does not match target host name '%s'\n",
+                  cn.c_str(), expectedName.c_str());
+        } else {
+            trace("No certificate subject name or alt names provided for expected host: '%s'\n",
+                  expectedName.c_str());
+        }
+        return 0;
+    }
+
+    const int count = sk_GENERAL_NAME_num(altNames.get());
+    std::vector<std::string> alternateNames;
+    for (int idx = 0; idx < count; ++idx) {
+        GENERAL_NAME *name = sk_GENERAL_NAME_value(altNames.get(), idx);
+        assert(name);
+        GENERAL_NAME_print(bio.get(), name);
+        char buf[256];
+        int read = BIO_read(bio.get(), buf, sizeof(buf));
+        if (read > 4) {
+            // the printing starts with DNS: hopefully it will forever do that
+            std::string san(buf + 4, read - 4);
+            alternateNames.push_back(std::move(san));
+            if (compareHost(san, expectedName)) {
+                trace("Found san that matched %s - %s\n", san.c_str(), expectedName.c_str());
+                return 1;
+            }
+        }
+    }
+
+    if (!cn.empty()) {
+        trace("certificate subject name '%s' or alternate names '%s' do not match '%s'\n",
+              cn.c_str(), join(alternateNames, ", ").c_str(), expectedName.c_str());
+    } else {
+        trace("certificate alternate names '%s' do not match '%s'\n",
+              join(alternateNames, ", ").c_str(), expectedName.c_str());
+    }
+    return 0;
+}
+
+bool compareHost(std::string actual, std::string expected)
+{
+    assert(!actual.empty());
+    assert(!expected.empty());
+    trace("compareHost %s %s\n", actual.c_str(), expected.c_str());
+
+    if (actual[actual.length() - 1] == '.') {
+        actual = actual.substr(0, actual.length() - 1);
+    }
+    if (expected[expected.length() - 1] == '.') {
+        expected = expected.substr(0, expected.length() - 1);
+    }
+
+    const std::vector<std::string> actualSplit = split(actual, ".");
+    if (strncmp(actual.c_str(), "*.", 2)) {
+        const bool ret = actual == expected;
+        trace("No starting wildcard, straight compare '%s' vs '%s' => %s\n",
+              actual.c_str(), expected.c_str(), ret ? "true" : "false");
+        return ret;
+    }
+
+    if (actualSplit.size() <= 2) {
+        trace("actual has too few pieces (%zu)\n", actualSplit.size());
+        return false;
+    }
+
+    const std::vector<std::string> expectedSplit = split(expected, ".");
+    if (actualSplit.size() > expectedSplit.size()) {
+        trace("actual has too many pieces, can't match '%s' vs '%s'",
+              actual.c_str(), expected.c_str());
+        return false;
+    }
+
+    size_t expectedIdx = expectedSplit.size() - actualSplit.size() + 1;
+    for (size_t idx = 1; idx < actualSplit.size(); ++idx, ++expectedIdx) {
+        if (actualSplit[idx] != expectedSplit[expectedIdx]) {
+            trace("Failed compare '%s' %zu '%s' %zu\n",
+                  actualSplit[idx].c_str(), idx, expectedSplit[expectedIdx].c_str(), expectedIdx);
+            return false;
+        }
+        trace("Successful compare '%s' %zu '%s' %zu\n",
+              actualSplit[idx].c_str(), idx, expectedSplit[expectedIdx].c_str(), expectedIdx);
+    }
+    return true;
+}
+
+int sslIndex()
+{
+    static int sSslIndex;
+    static pthread_once_t sOnce = PTHREAD_ONCE_INIT;
+    pthread_once(&sOnce, []() {
+        sSslIndex = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+    });
+    return sSslIndex;
+}
+size_t indexOf(const char *haystack, const char *needle)
+{
+    const char *str = strstr(haystack, needle);
+    if (!str) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return str - haystack;
+}
+
+std::string join(const std::vector<std::string> &strings, const std::string &delimiter)
+{
+    std::string ret;
+    size_t reserve = delimiter.size() * (strings.size() - 1);
+    for (const auto &ref : strings) {
+        reserve += ref.size();
+    }
+    ret.reserve(reserve);
+    for (const auto &ref : strings) {
+        ret += ref;
+    }
+    return ret;
+}
+
+std::vector<std::string> split(const std::string &string, const std::string &delimiter)
+{
+    size_t last = 0;
+    std::vector<std::string> ret;
+    while (true) {
+        const size_t next = string.find(delimiter, last);
+        if (next == std::string::npos)
+            break;
+        ret.push_back(string.substr(last, next - last));
+        last = next + 1;
+    }
+    ret.push_back(string.substr(last));
+    return ret;
 }
 }
