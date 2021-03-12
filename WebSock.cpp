@@ -1058,11 +1058,11 @@ int verifyServerName(const std::string &expectedName, const X509 *x509)
         if (read > 4) {
             // the printing starts with DNS: hopefully it will forever do that
             std::string san(buf + 4, read - 4);
-            alternateNames.push_back(std::move(san));
             if (compareHost(san, expectedName)) {
                 trace("Found san that matched %s - %s\n", san.c_str(), expectedName.c_str());
                 return 1;
             }
+            alternateNames.push_back(std::move(san));
         }
     }
 
