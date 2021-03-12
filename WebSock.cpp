@@ -174,9 +174,6 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
         break;
     case SSLConnecting:
         FD_SET(mFD, &r);
-        if (mFlags & ConnectWantWrite) {
-            FD_SET(mFD, &w);
-        }
         break;
     case WebSocketConnecting:
         FD_SET(mFD, &r);
@@ -192,6 +189,11 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
         }
         break;
     }
+    if (mSSLWantsWrite) {
+        trace("ssl wants write selecting for write\n");
+        FD_SET(mFD, &w);
+    }
+
     if (!mWriteBuffer.empty()) {
         trace("mWriteBuffer has %zu bytes, selecting for write\n", mWriteBuffer.size());
         FD_SET(mFD, &w);
@@ -203,7 +205,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
 {
     mWokenUp = false;
     trace("processSelect %s count: %d - read: %d write: %d - pipe: %d\n", stateToString(mState),
-           count, FD_ISSET(mFD, &r), FD_ISSET(mFD, &r), FD_ISSET(mPipe[0], &r));
+          count, FD_ISSET(mFD, &r), FD_ISSET(mFD, &r), FD_ISSET(mPipe[0], &r));
 
     if (FD_ISSET(mPipe[0], &r)) {
         char buf;
@@ -275,9 +277,53 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
             char buf[1024];
             while (true) {
                 int r;
-                EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
+                if (mSSL) {
+                    r = SSL_read(mSSL, buf, sizeof(buf));
+                } else {
+                    EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
+                }
                 if (r == -1) {
-                    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                    if (mSSL) {
+                        const int sslErr = SSL_get_error(mSSL, r);
+                        switch (sslErr) {
+                        case SSL_ERROR_NONE:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_NONE:\n", __LINE__); fflush(stdout);
+                            break;
+                        case SSL_ERROR_ZERO_RETURN:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_ZERO_RETURN:\n", __LINE__); fflush(stdout);
+                            mState = Closed;
+                            break;
+                        case SSL_ERROR_WANT_READ:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_READ:\n", __LINE__); fflush(stdout);
+                            break;
+                        case SSL_ERROR_WANT_WRITE:
+                            mSSLWantsWrite = true;
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_WRITE:\n", __LINE__); fflush(stdout);
+                            break;
+                        case SSL_ERROR_WANT_CONNECT:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CONNECT:\n", __LINE__); fflush(stdout);
+                            break;
+                        case SSL_ERROR_WANT_ACCEPT:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ACCEPT:\n", __LINE__); fflush(stdout);
+                            break;
+                        case SSL_ERROR_WANT_ASYNC_JOB:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ASYNC_JOB:\n", __LINE__); fflush(stdout);
+                            break;
+                        case SSL_ERROR_WANT_CLIENT_HELLO_CB:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CLIENT_HELLO_CB:\n", __LINE__); fflush(stdout);
+                            break;
+                        case SSL_ERROR_SYSCALL:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_SYSCALL:\n", __LINE__); fflush(stdout);
+                            mState = Error;
+                            break;
+                        case SSL_ERROR_SSL:
+                            trace("[WebSock.cpp:%d]: case SSL_ERROR_SSL:\n", __LINE__); fflush(stdout);
+                            mState = Error;
+                            break;
+                        default:
+                            break;
+                        }
+                    } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
                         trace("Got an error reading: %d %s\n",
                               errno, strerror(errno));
                         mState = Error;
@@ -303,7 +349,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
                 if (r == -1) {
                     if (errno != EWOULDBLOCK && errno != EAGAIN) {
                         trace("Got an error reading: %d %s\n",
-                               errno, strerror(errno));
+                              errno, strerror(errno));
                         mState = Error;
                     }
                     break;
@@ -323,7 +369,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
                     const int err = wslay_event_recv(mContext);
                     if (err < 0) {
                         trace("Something failed in wslay for %d closing %d (had %zu bytes, now has %zu bytes)",
-                               mFD, err, old, mRecvBuffer.size());
+                              mFD, err, old, mRecvBuffer.size());
                         mState = Error;
                         break;
                     }
@@ -452,11 +498,58 @@ void WebSocket::writeSocketBuffer()
         int w;
         assert(mWriteBuffer.size() > written);
         const unsigned char *data = &mWriteBuffer[0];
-        EINTRWRAP(w, ::write(mFD, data + written, mWriteBuffer.size() - written));
+        if (mSSL) {
+            w = SSL_write(mSSL, data + written, mWriteBuffer.size() - written);
+            if (!w) {
+                // seemingly not different anymore as per man SSL_write
+                w = -1;
+            }
+        } else {
+            EINTRWRAP(w, ::write(mFD, data + written, mWriteBuffer.size() - written));
+        }
         if (w == -1) {
-            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            if (mSSL) {
+                const int sslErr = SSL_get_error(mSSL, w);
+                switch (sslErr) {
+                case SSL_ERROR_NONE:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_NONE:\n", __LINE__); fflush(stdout);
+                    break;
+                case SSL_ERROR_ZERO_RETURN:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_ZERO_RETURN:\n", __LINE__); fflush(stdout);
+                    mState = Closed;
+                    break;
+                case SSL_ERROR_WANT_READ:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_READ:\n", __LINE__); fflush(stdout);
+                    break;
+                case SSL_ERROR_WANT_WRITE:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_WRITE:\n", __LINE__); fflush(stdout);
+                    break;
+                case SSL_ERROR_WANT_CONNECT:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CONNECT:\n", __LINE__); fflush(stdout);
+                    break;
+                case SSL_ERROR_WANT_ACCEPT:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ACCEPT:\n", __LINE__); fflush(stdout);
+                    break;
+                case SSL_ERROR_WANT_ASYNC_JOB:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ASYNC_JOB:\n", __LINE__); fflush(stdout);
+                    break;
+                case SSL_ERROR_WANT_CLIENT_HELLO_CB:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CLIENT_HELLO_CB:\n", __LINE__); fflush(stdout);
+                    break;
+                case SSL_ERROR_SYSCALL:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_SYSCALL:\n", __LINE__); fflush(stdout);
+                    mState = Error;
+                    break;
+                case SSL_ERROR_SSL:
+                    trace("[WebSock.cpp:%d]: case SSL_ERROR_SSL:\n", __LINE__); fflush(stdout);
+                    mState = Error;
+                    break;
+                default:
+                    break;
+                }
+            } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
                 trace("Got an error writing: %d %s\n",
-                       errno, strerror(errno));
+                      errno, strerror(errno));
                 mState = Error;
             } else {
                 trace("Got EAGAIN writing %zu bytes\n", mWriteBuffer.size() - written);
@@ -534,18 +627,18 @@ void WebSocket::createSSL()
 
 void WebSocket::sslConnect(int count, const fd_set &r, const fd_set &w)
 {
-    trace("sslConnect flags: 0x%x - read: %d (%d) write: %d\n", mFlags,
-           FD_ISSET(mFD, &r),
-           FD_ISSET(mFD, &r) ? ([](int fd) -> int {
-               int available;
-               ioctl(fd, FIONREAD, &available);
-               return available;
-           })(mFD) : -1,
-           FD_ISSET(mFD, &w));
+    trace("sslConnect wants write: %d - read: %d (%d) write: %d\n", mSSLWantsWrite,
+          FD_ISSET(mFD, &r),
+          FD_ISSET(mFD, &r) ? ([](int fd) -> int {
+              int available;
+              ioctl(fd, FIONREAD, &available);
+              return available;
+          })(mFD) : -1,
+          FD_ISSET(mFD, &w));
 
     if (FD_ISSET(mFD, &r) || FD_ISSET(mFD, &w)) {
         ERR_clear_error();
-        mFlags &= ~(ConnectWantWrite|ConnectWantRead);
+        mSSLWantsWrite = false;
         const int connect = SSL_connect(mSSL);
         trace("CALLED CONNECT %d\n", connect);
         if (connect <= 0) {
@@ -559,11 +652,10 @@ void WebSocket::sslConnect(int count, const fd_set &r, const fd_set &w)
                 mState = Closed;
                 break;
             case SSL_ERROR_WANT_READ:
-                mFlags |= ConnectWantRead;
                 trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_READ:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_WANT_WRITE:
-                mFlags |= ConnectWantWrite;
+                mSSLWantsWrite = true;
                 trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_WRITE:\n", __LINE__); fflush(stdout);
                 break;
             case SSL_ERROR_WANT_CONNECT:
@@ -657,7 +749,7 @@ void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
 
     if (where & SSL_CB_HANDSHAKE_DONE) {
         trace("[WEBSOCK SSL] - %s: handshake done session %sreused\n", sock->mOptions.url.c_str(),
-               SSL_session_reused(const_cast<SSL *>(ssl)) ? "" : "not ");
+              SSL_session_reused(const_cast<SSL *>(ssl)) ? "" : "not ");
         // data->metrics.setSSLMode(SSL_session_reused(const_cast<SSL *>(ssl)) ? NetworkMetrics::SSLResumed : NetworkMetrics::SSL);
     }
 
@@ -665,8 +757,8 @@ void WebSocket::sslCtxInfoCallback(const SSL *ssl, int where, int ret)
         trace("[WEBSOCK SSL] - %s: %s:%s\n", sock->mOptions.url.c_str(), str, SSL_state_string_long(ssl));
     } else if (where & SSL_CB_ALERT) {
         trace("[WEBSOCK SSL] - %s: SSL3 alert %s:%s:%s\n", sock->mOptions.url.c_str(),
-               str, SSL_alert_type_string_long(ret),
-               SSL_alert_desc_string_long(ret));
+              str, SSL_alert_type_string_long(ret),
+              SSL_alert_desc_string_long(ret));
     } else if (where & SSL_CB_EXIT && ret <= 0) {
         trace("[WEBSOCK SSL] - %s: %s:%s in %s\n", sock->mOptions.url.c_str(), str, ret ? "error" : "failed",
                SSL_state_string_long(ssl));

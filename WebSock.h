@@ -93,11 +93,7 @@ private:
 
     static std::unordered_map<SSL *, WebSocket *> sSockets;
     State mState { Unset };
-    enum Flag {
-        ConnectWantRead = 0x1,
-        ConnectWantWrite = 0x2
-    };
-    unsigned int mFlags { 0 };
+    bool mSSLWantsWrite { false };
     unsigned long long mConnectTimeout { std::numeric_limits<unsigned long long>::max() };
     Options mOptions;
     int mFD { -1 };
