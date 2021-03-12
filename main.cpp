@@ -15,7 +15,9 @@ int main(int argc, char **argv)
     WebSocket::Options options;
     options.url = "wss://echo.websocket.org";
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--truststore")) {
+        if (!strcmp(argv[i], "--verbose") || !strcmp(argv[i], "-v")) {
+            WebSocket::verbose = true;
+        } else if (!strcmp(argv[i], "--truststore")) {
             if (i + 1 < argc) {
                 FILE *f = fopen(argv[++i], "r");
                 if (!f) {
@@ -56,7 +58,7 @@ int main(int argc, char **argv)
         }
     };
 
-    options.onClose = [](WebSocket *, WebSocket::CloseEvent &&event) {
+    options.onClose = [](WebSocket *,WebSocket::CloseEvent &&event) {
         printf("GOT CLOSE EVENT %s %d %s\n", event.wasClean ? "clean" : "dirty",
                event.statusCode, event.reason.c_str());
     };

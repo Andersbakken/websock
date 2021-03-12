@@ -17,18 +17,13 @@
         ret = op;                               \
     } while (ret == -1 && errno == EINTR)
 
-#if 0
-#define trace(...) printf(__VA_ARGS__)
-#else
-#define trace(...)
-#endif
-
 class WebSocket
 {
 public:
     WebSocket();
     virtual ~WebSocket();
 
+    static bool verbose;
     struct MessageEvent {
         std::string text;
         std::vector<unsigned char> binary;
@@ -107,5 +102,14 @@ private:
     std::vector<unsigned char> mWriteBuffer, mRecvBuffer;
     bool mWss { false };
 };
+
+#if 1
+#define trace(...)  \
+    if (WebSocket::verbose) \
+        printf(__VA_ARGS__)
+#else
+#define trace(...)
+#endif
+
 
 #endif /* WEBSOCK_H */

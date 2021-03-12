@@ -42,6 +42,7 @@ std::vector<std::string> split(const std::string &string, const std::string &spl
 }
 
 std::unordered_map<SSL *, WebSocket *> WebSocket::sSockets;
+bool WebSocket::verbose = false;
 WebSocket::WebSocket()
 {
 }
