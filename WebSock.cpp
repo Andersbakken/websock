@@ -189,6 +189,7 @@ void WebSocket::prepareSelect(int &nfds, fd_set &r, fd_set &w, unsigned long lon
         }
         break;
     }
+
     if (mSSLWantsWrite) {
         trace("ssl wants write selecting for write\n");
         FD_SET(mFD, &w);
@@ -275,55 +276,10 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
         }
         if (FD_ISSET(mFD, &r)) {
             char buf[1024];
-            while (true) {
-                int r;
-                if (mSSL) {
-                    r = SSL_read(mSSL, buf, sizeof(buf));
-                } else {
-                    EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
-                }
+            while (mState == WebSocketSentUpgrade) {
+                int r = readData(buf, sizeof(buf));
                 if (r == -1) {
-                    if (mSSL) {
-                        const int sslErr = SSL_get_error(mSSL, r);
-                        switch (sslErr) {
-                        case SSL_ERROR_NONE:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_NONE:\n", __LINE__); fflush(stdout);
-                            break;
-                        case SSL_ERROR_ZERO_RETURN:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_ZERO_RETURN:\n", __LINE__); fflush(stdout);
-                            mState = Closed;
-                            break;
-                        case SSL_ERROR_WANT_READ:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_READ:\n", __LINE__); fflush(stdout);
-                            break;
-                        case SSL_ERROR_WANT_WRITE:
-                            mSSLWantsWrite = true;
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_WRITE:\n", __LINE__); fflush(stdout);
-                            break;
-                        case SSL_ERROR_WANT_CONNECT:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CONNECT:\n", __LINE__); fflush(stdout);
-                            break;
-                        case SSL_ERROR_WANT_ACCEPT:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ACCEPT:\n", __LINE__); fflush(stdout);
-                            break;
-                        case SSL_ERROR_WANT_ASYNC_JOB:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_ASYNC_JOB:\n", __LINE__); fflush(stdout);
-                            break;
-                        case SSL_ERROR_WANT_CLIENT_HELLO_CB:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_WANT_CLIENT_HELLO_CB:\n", __LINE__); fflush(stdout);
-                            break;
-                        case SSL_ERROR_SYSCALL:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_SYSCALL:\n", __LINE__); fflush(stdout);
-                            mState = Error;
-                            break;
-                        case SSL_ERROR_SSL:
-                            trace("[WebSock.cpp:%d]: case SSL_ERROR_SSL:\n", __LINE__); fflush(stdout);
-                            mState = Error;
-                            break;
-                        default:
-                            break;
-                        }
-                    } else if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                    if (errno != EWOULDBLOCK && errno != EAGAIN) {
                         trace("Got an error reading: %d %s\n",
                               errno, strerror(errno));
                         mState = Error;
@@ -340,12 +296,12 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
         }
         break;
     case Connected: {
-        const bool wasEmpty = mWriteBuffer.empty();
+        const bool writeBufferWasEmpty = mWriteBuffer.empty();
         if (FD_ISSET(mFD, &r)) {
             char buf[1024];
             while (true) {
                 int r;
-                EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
+                EINTRWRAP(r, readData(buf, sizeof(buf)));
                 if (r == -1) {
                     if (errno != EWOULDBLOCK && errno != EAGAIN) {
                         trace("Got an error reading: %d %s\n",
@@ -365,7 +321,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
             if (mState == Connected) {
                 size_t old;
                 do {
-                    old = mWriteBuffer.size();
+                    old = mRecvBuffer.size();
                     const int err = wslay_event_recv(mContext);
                     if (err < 0) {
                         trace("Something failed in wslay for %d closing %d (had %zu bytes, now has %zu bytes)",
@@ -376,7 +332,7 @@ void WebSocket::processSelect(int count, const fd_set &r, const fd_set &w)
                 } while (mRecvBuffer.size() && old != mRecvBuffer.size());
             }
         }
-        if (FD_ISSET(mFD, &w) || (wasEmpty && !mWriteBuffer.empty())) {
+        if (FD_ISSET(mFD, &w) || (writeBufferWasEmpty && !mWriteBuffer.empty())) {
             writeSocketBuffer();
         }
 
@@ -440,9 +396,12 @@ std::string WebSocket::createUpgradeRequest()
 void WebSocket::acceptUpgrade()
 {
     const char *data = mUpgradeResponse.c_str();
+    if (!strstr(data, "\r\n\r\n"))
+        return;
     const char *header = strcasestr_(data + 1, "\nsec-websocket-accept:");
     if (!header)
         return;
+    trace("Got upgrade response\n%s\n", data);
     header += 22;
     while (isspace(static_cast<unsigned char>(*header)))
         ++header;
@@ -563,6 +522,40 @@ void WebSocket::writeSocketBuffer()
         }
     } while (written < mWriteBuffer.size());
     mWriteBuffer.erase(mWriteBuffer.begin(), mWriteBuffer.begin() + written);
+}
+
+int WebSocket::readData(void *buf, size_t bufSize)
+{
+    int r;
+    if (!mSSL) {
+        EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
+        return r;
+    }
+
+    mSSLWantsWrite = false;
+    r = SSL_read(mSSL, buf, sizeof(buf));
+    if (r > 0) {
+        return r;
+    }
+    const int sslErr = SSL_get_error(mSSL, r);
+    switch (sslErr) {
+    case SSL_ERROR_ZERO_RETURN:
+        return 0;
+    case SSL_ERROR_WANT_WRITE:
+        mSSLWantsWrite = true;
+        errno = EWOULDBLOCK;
+        break;
+    case SSL_ERROR_WANT_READ:
+        errno = EWOULDBLOCK;
+        break;
+    case SSL_ERROR_SYSCALL:
+        errno = EPROTO; // good enough
+        break;
+    default:
+        assert(0);
+        break;
+    }
+    return -1;
 }
 
 void WebSocket::createSSL()

@@ -42,20 +42,15 @@ int main(int argc, char **argv)
     }
     options.connectTimeoutMS = 8000;
     options.onMessage = [](WebSocket *, WebSocket::MessageEvent &&event) {
-        printf("GOT MESSAGE EVENT %s %d\n", event.text.empty() ? "binary" : "text", event.statusCode);
+        printf("Got message event %s %d\n", event.text.empty() ? "binary" : "text", event.statusCode);
         if (event.text.empty()) {
             for (size_t i=0; i<event.binary.size(); ++i) {
-                if (i) {
-                    printf(" 0x%02x", event.binary[i]);
-                    if (i % 16 == 0)
-                        printf("\n");
-                } else {
-                    printf("0x%02x", event.binary[i]);
-                }
-                if (i % 16 != 0) {
+                printf("0x%02x ", event.binary[i]);
+                if (i && i % 16 == 0) {
                     printf("\n");
                 }
             }
+            printf("\n");
         } else {
             printf("%s\n", event.text.c_str());
         }

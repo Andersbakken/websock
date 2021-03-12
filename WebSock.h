@@ -17,7 +17,7 @@
         ret = op;                               \
     } while (ret == -1 && errno == EINTR)
 
-#if 1
+#if 0
 #define trace(...) printf(__VA_ARGS__)
 #else
 #define trace(...)
@@ -79,6 +79,7 @@ private:
     void acceptUpgrade();
     void addToWriteBuffer(const void *data, size_t len);
     void writeSocketBuffer();
+    int readData(void *buf, size_t bufSize);
 
     void createSSL();
     void sslConnect(int count, const fd_set &r, const fd_set &w);
