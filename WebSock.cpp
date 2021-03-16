@@ -529,12 +529,12 @@ int WebSocket::readData(void *buf, size_t bufSize)
 {
     int r;
     if (!mSSL) {
-        EINTRWRAP(r, ::read(mFD, buf, sizeof(buf)));
+        EINTRWRAP(r, ::read(mFD, buf, bufSize));
         return r;
     }
 
     mSSLWantsWrite = false;
-    r = SSL_read(mSSL, buf, sizeof(buf));
+    r = SSL_read(mSSL, buf, bufSize);
     if (r > 0) {
         return r;
     }
